@@ -58,6 +58,12 @@ from fastapi.testclient import TestClient  # noqa: E402
 from app.main import app as fastapi_app  # noqa: E402
 from app.canonical import canonical_bytes, sha256_hex  # noqa: E402
 from app.q3_mailroom import proposal_digest  # noqa: E402
+from app import store as _store  # noqa: E402
+from app.otlp import Trace as _Trace  # noqa: E402
+
+
+def spans_of(run_id):
+    return _Trace(_store.get("q4_run", run_id)["trace"]).dump()["resourceSpans"][0]["scopeSpans"][0]["spans"]
 
 c = TestClient(fastapi_app)
 PASS, FAIL = [], []
@@ -220,7 +226,7 @@ r = c.post("/v2/incidents", json=inc, headers={"traceparent": TP, "tracestate": 
 run = r.json()
 check("Q4 waiting with 2 parallel diagnostics", run["status"] == "waiting" and len(run["dispatches"]) == 2)
 check("Q4 args filtered to schema", run["dispatches"][0]["arguments"] == {"service": "api"})
-spans = run["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"]
+spans = spans_of("run1")
 check("Q4 continues incoming trace", all(s["traceId"] == "ab" * 16 for s in spans))
 check("Q4 tracestate preserved", run["dispatches"][0].get("tracestate") == "vendor=1")
 server = [s for s in spans if s["kind"] == 2]
@@ -293,7 +299,7 @@ r = c.post("/v2/incidents/run2/receipts", json={"receiptId": "t1", "outcomes": [
      "nonce": "n"}]}).json()
 check("Q4 timeout -> failed, effect suppressed", r["status"] == "failed" and r["dispatches"] == []
       and len(r["suppressed"]) == 1 and r["chosenEffect"] is None)
-sp = [s for s in r["otlp"]["resourceSpans"][0]["scopeSpans"][0]["spans"] if s["name"].startswith("POST tool/")]
+sp = [s for s in spans_of("run2") if s["name"].startswith("POST tool/")]
 check("Q4 timeout span", attrs(sp[0])["error.type"] == "timeout" and sp[0]["status"]["code"] == 2)
 
 # approval flow

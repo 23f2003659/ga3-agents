@@ -299,21 +299,16 @@ def _apply_approval(run: dict, trace: Trace, rid: str, a: dict) -> list:
 
 # ====================================================================== views
 def _view(run: dict, new_dispatches: list) -> dict:
-    out = {"runId": run["runId"], "status": run["status"], "diagnosis": run["diagnosis"]}
-    if run["status"] in TERMINAL:
-        out["dispatches"] = []
-        out["approvals"] = []
-    else:
-        out["dispatches"] = new_dispatches
+    if run["status"] not in TERMINAL:
         appr = run.get("approval")
-        out["approvals"] = ([{k: appr[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}]
-                            if appr and appr.get("pending") and not new_dispatches else [])
-    out["chosenEffect"] = run.get("chosenEffect")
-    out["suppressed"] = run["suppressed"]
-    out["actionLog"] = run["actionLog"]
-    out["receiptLog"] = run["receiptLog"]
-    out["otlp"] = Trace(run["trace"]).dump()
-    return out
+        approvals = ([{k: appr[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}]
+                     if appr and appr.get("pending") and not new_dispatches else [])
+        return {"runId": run["runId"], "status": "waiting", "diagnosis": run["diagnosis"],
+                "dispatches": new_dispatches, "approvals": approvals}
+    return {"runId": run["runId"], "status": run["status"], "diagnosis": run["diagnosis"],
+            "chosenEffect": run.get("chosenEffect"), "suppressed": run["suppressed"],
+            "actionLog": run["actionLog"], "receiptLog": run["receiptLog"],
+            "otlp": Trace(run["trace"]).dump(), "dispatches": [], "approvals": []}
 
 
 def get_incident(run_id: str) -> JSONResponse:

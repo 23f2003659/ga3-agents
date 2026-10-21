@@ -61,8 +61,8 @@ def _check_version(h: dict) -> Optional[Response]:
 
 def _check_media(h: dict) -> Optional[Response]:
     ctype = h.get("content-type", "").split(";")[0].strip().lower()
-    if ctype not in (A2A_MEDIA, "application/json"):
-        return _err(415 if ctype else 400, "UNSUPPORTED_MEDIA_TYPE")
+    if ctype != A2A_MEDIA:
+        return _err(415, "UNSUPPORTED_MEDIA_TYPE")
     return None
 
 
@@ -135,9 +135,7 @@ def message_send(h: dict, raw: bytes) -> Response:
             if prior["hash"] != msg_hash:
                 return _err(409, "IDEMPOTENCY_CONFLICT")
             task = store.get(NS_TASK, prior["taskId"])
-            if prior.get("response") is not None:
-                return _a2a(prior["response"])
-            return _a2a({"task": _public(task)})
+            return _a2a({"task": _public(task)})   # current stored Task (terminal if finished)
 
         media = parts[0].get("mediaType")
         if media == IN_RESULTS:
