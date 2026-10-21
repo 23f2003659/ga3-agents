@@ -91,7 +91,7 @@ task = r.json()["task"]
 props = task["artifacts"][0]["parts"][0]["data"]["proposals"]
 check("Q2 INPUT_REQUIRED", task["status"]["state"] == "TASK_STATE_INPUT_REQUIRED")
 check("Q2 varied actions", len({p["action"] for p in props}) == 5)
-check("Q2 refs normalized + validated", all(p["evidenceRefs"] == ["[A-1]", "[B-2]", "[C-3]"] for p in props))
+check("Q2 refs normalized + validated", all(p["evidenceRefs"] == ["A-1", "B-2", "C-3"] for p in props))
 check("Q2 amount int + currency upper", props[0]["facts"]["amountMinor"] == 1000 and props[0]["facts"]["currency"] == "INR")
 check("Q2 rationale names action + 2 refs", all(p["action"] in p["rationale"] and len(p["rationale"]) >= 60 for p in props))
 check("Q2 actionId >= 12 unique", len({p["actionId"] for p in props}) == 5 and all(len(p["actionId"]) >= 12 for p in props))

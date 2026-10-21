@@ -16,11 +16,12 @@ from typing import Any
 from . import store
 from .canonical import sha256_hex
 from .llm import LLMError, chat_json, parallel
+from .mailroom_repair import repair
 
 ACTIONS = ["create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action"]
 CHUNK = int(os.environ.get("Q3_CHUNK", "12"))
-CACHE_VERSION = "q3v2"
+CACHE_VERSION = "q3v3"
 
 PAYLOAD_KEYS = {
     "create_draft": ["recipient", "referenceId", "status", "template"],
@@ -187,7 +188,9 @@ def _validate(d: dict, dec: dict, allowed: list[str]) -> dict | None:
             evidence.append(e)
     if not evidence:
         return None
-    return {"action": action, "target": target, "payload": payload, "evidence": evidence}
+    fixed = repair(d, {"action": action, "target": target, "payload": payload, "evidence": evidence})
+    fixed["evidence"] = [e for e in fixed["evidence"] if e in valid] or evidence
+    return fixed
 
 
 def _fallback(d: dict) -> dict:

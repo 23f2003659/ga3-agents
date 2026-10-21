@@ -21,7 +21,7 @@ from .llm import LLMError, chat_json, parallel
 
 ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
 CHUNK = int(os.environ.get("Q2_CHUNK", "12"))
-CACHE_VERSION = "q2v2"
+CACHE_VERSION = "q2v3"
 
 SYSTEM = """You are a careful accounts-payable controller. For EACH invoice package decide exactly one action.
 
@@ -43,16 +43,16 @@ Reading rules:
   sheets, archived/historical examples, training/sample material, superseded policies, hypotheticals and negated
   statements ("this is NOT a duplicate", "no hold is required").
 - evidenceRefs = exactly the three bracketed references from that determining paragraph, copied exactly as written
-  (including the square brackets). Never include the cover-sheet reference or references from archive/training text.
+  but WITHOUT the square brackets (e.g. "R_ABC123"). Never include the cover-sheet reference or references from archive/training text.
 - facts = the real invoice under review: vendorName, invoiceNumber, amountMinor (integer in minor units, e.g.
   INR 1,234.50 -> 123450), currency (ISO code).
 - rationale: 80-600 characters. Start with the action name, explain which controlling fact drives it, and cite at
   least two of the evidenceRefs verbatim.
 
 Return ONLY JSON: {"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...",
-"amountMinor":0,"currency":"..."},"evidenceRefs":["[..]","[..]","[..]"],"rationale":"..."}]}"""
+"amountMinor":0,"currency":"..."},"evidenceRefs":["R_..","R_..","R_.."],"rationale":"..."}]}"""
 
-_REF_RE = re.compile(r"\[[^\[\]\n]{1,80}\]")
+_REF_RE = re.compile(r"\[([A-Za-z0-9_.:-]{3,80})\]")
 
 
 def _fingerprint(pkg: dict) -> str:
@@ -126,8 +126,36 @@ def _refs_in(pkg: dict) -> list[str]:
 
 
 def _norm_ref(r: str) -> str:
-    r = str(r).strip()
-    return r if r.startswith("[") else f"[{r.strip('[]')}]"
+    return str(r).strip().strip("[]").strip()
+
+
+_COVER_RE = re.compile(r"Supplier\s+(?P<vendor>.+?);\s*invoice\s+(?P<inv>[A-Za-z0-9_./-]+);\s*stated total\s+"
+                       r"(?P<cur>[A-Z]{3})\s+(?P<amt>[0-9][0-9,]*(?:\.[0-9]+)?)", re.I)
+_ZERO_DEC = {"JPY", "KRW", "VND", "CLP", "ISK", "HUF"}
+_DECOY = ("archive note", "training appendix", "training material", "non-operative", "cover sheet",
+          "superseded", "hypothetical", "unrelated")
+
+
+def _cover_facts(pkg: dict) -> dict | None:
+    for doc in pkg.get("documents") or []:
+        m = _COVER_RE.search(str(doc.get("text", "")))
+        if m:
+            cur = m.group("cur").upper()
+            amt = float(m.group("amt").replace(",", ""))
+            minor = int(round(amt * (1 if cur in _ZERO_DEC else 100)))
+            return {"vendorName": m.group("vendor").strip(), "invoiceNumber": m.group("inv").strip(),
+                    "amountMinor": minor, "currency": cur}
+    return None
+
+
+def _decisive_paragraphs(pkg: dict) -> list[list[str]]:
+    out = []
+    for doc in pkg.get("documents") or []:
+        for para in re.split(r"\n\s*\n", str(doc.get("text", ""))):
+            refs = _REF_RE.findall(para)
+            if len(refs) >= 2 and not any(k in para.lower() for k in _DECOY):
+                out.append(refs)
+    return out
 
 
 def _validate(pkg: dict, d: dict) -> dict | None:
@@ -141,9 +169,16 @@ def _validate(pkg: dict, d: dict) -> dict | None:
         if (nr in known or not known) and nr not in refs:
             refs.append(nr)
     refs = refs[:3]
+    paras = _decisive_paragraphs(pkg)
+    if len(paras) == 1:
+        refs = paras[0][:3]                      # the single controlling paragraph
+    elif paras:
+        best = max(paras, key=lambda p: len(set(p) & set(refs)))
+        if set(refs) <= set(best) or len(set(best) & set(refs)) >= 2:
+            refs = best[:3]
     if len(refs) < 2:
         return None
-    facts = d.get("facts") or {}
+    facts = _cover_facts(pkg) or d.get("facts") or {}
     try:
         amount = int(round(float(str(facts.get("amountMinor", 0)).replace(",", ""))))
     except Exception:
@@ -162,7 +197,7 @@ def _validate(pkg: dict, d: dict) -> dict | None:
 
 
 def _fallback(pkg: dict) -> dict:
-    refs = _refs_in(pkg)[:3] or ["[unverified]", "[unverified-2]"]
+    refs = _refs_in(pkg)[:3] or ["unverified-1", "unverified-2"]
     return {
         "action": "hold_invoice",
         "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
