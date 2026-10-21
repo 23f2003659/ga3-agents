@@ -84,8 +84,8 @@ def create_incident(headers: dict, raw: bytes) -> JSONResponse:
         diag_ids = []
         new_dispatches = []
         for i, d in enumerate(plan["diagnostics"]):
-            aid = "act-" + _sid(run_id, "diag", i, d["toolName"])
-            act = {"actionId": aid, "callId": "call-" + _sid(run_id, "diag-call", i, d["toolName"]),
+            aid = "act_" + _sid(run_id, "diag", i, d["toolName"])
+            act = {"actionId": aid, "callId": "call_" + _sid(run_id, "diag-call", i, d["toolName"]),
                    "phase": "diagnostic", "toolName": d["toolName"], "arguments": d["arguments"],
                    "evidence": d["evidence"], "attempt": 0, "state": "pending"}
             run["actions"][aid] = act
@@ -96,8 +96,8 @@ def create_incident(headers: dict, raw: bytes) -> JSONResponse:
             trace.add_join(diag_ids)
         eff = plan.get("effect")
         if eff and eff.get("toolName"):
-            aid = "act-" + _sid(run_id, "effect", eff["toolName"])
-            run["effect"] = {"actionId": aid, "callId": "call-" + _sid(run_id, "effect-call", eff["toolName"]),
+            aid = "act_" + _sid(run_id, "effect", eff["toolName"])
+            run["effect"] = {"actionId": aid, "callId": "call_" + _sid(run_id, "effect-call", eff["toolName"]),
                              "phase": "effect", "toolName": eff["toolName"], "arguments": eff["arguments"],
                              "evidence": eff["evidence"], "attempt": 0, "state": "planned",
                              "needsApproval": eff["toolName"] in approval_needed}
@@ -252,7 +252,7 @@ def _advance(run: dict, trace: Trace) -> list:
     if eff["state"] == "planned":
         if eff["needsApproval"] and not (run.get("approval") or {}).get("nonce"):
             if run.get("approval") is None:
-                appr = {"approvalId": "apr-" + _sid(run["runId"], "approval", eff["actionId"]),
+                appr = {"approvalId": "apr_" + _sid(run["runId"], "approval", eff["actionId"]),
                         "actionId": eff["actionId"], "toolName": eff["toolName"],
                         "argumentsDigest": sha256_hex(eff["arguments"])}
                 run["approval"] = dict(appr, nonce=None, pending=True)
@@ -299,16 +299,15 @@ def _apply_approval(run: dict, trace: Trace, rid: str, a: dict) -> list:
 
 # ====================================================================== views
 def _view(run: dict, new_dispatches: list) -> dict:
-    if run["status"] not in TERMINAL:
-        appr = run.get("approval")
-        approvals = ([{k: appr[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}]
-                     if appr and appr.get("pending") and not new_dispatches else [])
-        return {"runId": run["runId"], "status": "waiting", "diagnosis": run["diagnosis"],
-                "dispatches": new_dispatches, "approvals": approvals}
+    terminal = run["status"] in TERMINAL
+    appr = run.get("approval")
+    approvals = ([{k: appr[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}]
+                 if not terminal and appr and appr.get("pending") and not new_dispatches else [])
     return {"runId": run["runId"], "status": run["status"], "diagnosis": run["diagnosis"],
+            "dispatches": [] if terminal else new_dispatches, "approvals": approvals,
             "chosenEffect": run.get("chosenEffect"), "suppressed": run["suppressed"],
             "actionLog": run["actionLog"], "receiptLog": run["receiptLog"],
-            "otlp": Trace(run["trace"]).dump(), "dispatches": [], "approvals": []}
+            "otlp": Trace(run["trace"]).dump()}
 
 
 def get_incident(run_id: str) -> JSONResponse:

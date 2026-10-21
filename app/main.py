@@ -30,6 +30,24 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
                    expose_headers=["*"])
 
 GLB_PATH = os.environ.get("GLB_PATH", "static/face.glb")
+
+
+@app.middleware("http")
+async def _access_log(request: Request, call_next):
+    """Record requests that never reach a route handler's capture (404/405/500, exceptions)."""
+    try:
+        resp = await call_next(request)
+    except Exception as e:  # pragma: no cover - logged for diagnosis
+        import traceback
+        if DEBUG_TOKEN:
+            store.capture_add({"method": request.method, "path": request.url.path, "status": 500,
+                               "headers": {}, "body": "", "bodyBytes": 0, "ms": 0,
+                               "response": "EXCEPTION " + "".join(traceback.format_exception(e))[-3000:]})
+        return JSONResponse({"error": "internal error"}, status_code=500)
+    if DEBUG_TOKEN and (resp.status_code in (404, 405) or resp.status_code >= 500):
+        store.capture_add({"method": request.method, "path": request.url.path, "status": resp.status_code,
+                           "headers": {}, "body": "", "bodyBytes": 0, "ms": 0, "response": "(access log)"})
+    return resp
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
 CAPTURE_LIMIT = 2_500_000
 

@@ -274,7 +274,7 @@ def attrs(s):
 cl = [s for s in spans if s["name"] == "POST tool/query_metrics"]
 a1, a2 = attrs(cl[0]), attrs(cl[1])
 check("Q4 503 span error", cl[0]["status"]["code"] == 2 and a1["error.type"] == "503" and a1["http.request.resend_count"] == 0)
-check("Q4 retry span ok", cl[1]["status"]["code"] != 2 and "error.type" not in a2 and a2["http.request.resend_count"] == 1
+check("Q4 retry span ok", cl[1].get("status", {}).get("code", 0) != 2 and "error.type" not in a2 and a2["http.request.resend_count"] == 1
       and a2["ga5.receipt.nonce"] == "n3")
 check("Q4 unique span ids", len({s["spanId"] for s in spans}) == len(spans))
 check("Q4 GET equals final", c.get("/v2/incidents/run1").json() == fin)

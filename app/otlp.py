@@ -78,11 +78,10 @@ class Trace:
             "spanId": _hex(8),
             "name": name,
             "kind": kind,
-            "startTimeUnixNano": str(start),
-            "endTimeUnixNano": str(start + 1_000_000),
+            "startTimeUnixNano": int(start),
+            "endTimeUnixNano": int(start + 1_000_000),
             "attributes": [s_attr("ga5.run.id", self.s["runId"]),
                            s_attr("ga5.public.marker", self.s["marker"])] + attrs,
-            "status": {"code": 0},
         }
         if parent:
             span["parentSpanId"] = parent
@@ -129,7 +128,7 @@ class Trace:
         elif isinstance(status, int) and status >= 400:
             span["attributes"].append(s_attr("error.type", str(status)))
             span["status"] = {"code": 2}
-        span["endTimeUnixNano"] = str(time.time_ns())
+        span["endTimeUnixNano"] = time.time_ns()
 
     def add_join(self, action_ids: list[str]) -> None:
         if self.s.get("joinId"):
@@ -150,7 +149,7 @@ class Trace:
         if g:
             g["attributes"] += [s_attr("ga5.approval.nonce", nonce), s_attr("ga5.receipt.id", receipt_id),
                                 s_attr("ga5.receipt.nonce", nonce), s_attr("ga5.approval.decision", decision)]
-            g["endTimeUnixNano"] = str(time.time_ns())
+            g["endTimeUnixNano"] = time.time_ns()
 
     def dump(self) -> dict:
         return {"resourceSpans": [{
