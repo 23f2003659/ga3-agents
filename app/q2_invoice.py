@@ -169,13 +169,20 @@ def _public_task(task: dict) -> dict:
 # --------------------------------------------------------------------------
 # POST /message:send
 # --------------------------------------------------------------------------
-def message_send(request: Request, body: dict) -> Response:
+async def message_send(request: Request) -> Response:
     principal = _principal(request)
     if not principal:
         return _err(401, "UNAUTHENTICATED")
     perr = _check_protocol(request)
     if perr:
         return perr
+
+    try:
+        body = await request.json()
+    except Exception:
+        return _err(400, "INVALID_JSON")
+    if not isinstance(body, dict):
+        return _err(400, "INVALID_JSON")
 
     message = body.get("message")
     if not isinstance(message, dict):

@@ -60,10 +60,7 @@ def agent_card(request: Request):
 
 @app.post("/a2a/message:send")
 async def a2a_send(request: Request):
-    body = await _safe_json(request)
-    if body is None:
-        return JSONResponse({"error": "invalid JSON"}, status_code=400)
-    return q2.message_send(request, body)
+    return await q2.message_send(request)
 
 
 @app.get("/a2a/tasks")
