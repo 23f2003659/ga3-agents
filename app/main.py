@@ -31,7 +31,7 @@ app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], all
 
 GLB_PATH = os.environ.get("GLB_PATH", "static/face.glb")
 DEBUG_TOKEN = os.environ.get("DEBUG_TOKEN", "")
-CAPTURE_LIMIT = 300_000
+CAPTURE_LIMIT = 2_500_000
 
 
 def _headers(request: Request) -> dict:

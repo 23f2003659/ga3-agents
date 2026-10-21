@@ -79,7 +79,7 @@ def cache_put(ns: str, fingerprint: str, value: Any) -> None:
 
 
 # ---- debug capture (only used when DEBUG_TOKEN is configured) ----
-def capture_add(entry: dict, keep: int = 60) -> None:
+def capture_add(entry: dict, keep: int = 40) -> None:
     with _db_lock:
         _db().execute("INSERT INTO capture (ts, v) VALUES (?, ?)", (time.time(), json.dumps(entry)))
         _db().execute("DELETE FROM capture WHERE id NOT IN (SELECT id FROM capture ORDER BY id DESC LIMIT ?)", (keep,))
