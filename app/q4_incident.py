@@ -1,407 +1,325 @@
-"""Q4 — Observable Incident Triage agent.
+"""Q4 — Observable Incident Triage (profile ga5-incident-agent/v2).
 
-Endpoints:
-  POST /v2/incidents
-  POST /v2/incidents/{runId}/receipts
-  GET  /v2/incidents/{runId}
-
-State machine per run:
-  1. First POST: model picks rootCause from allowedRootCauses + cites evidence,
-     plans 1-3 diagnostic dispatches (or an approval request for destructive
-     effects). status="waiting".
-  2. Receipts drive progress: 503 -> one retry (new CLIENT span, attempt+1);
-     timeout -> fail dependent effect; diagnosis_confirmed -> emit one effect.
-     Approval receipt -> dispatch the approved effect.
-  3. Terminal: status completed/failed with actionLog, receiptLog, and a full
-     OTLP trace correlating every action and receipt.
-
-Replay reads stored state (no model call). Changed content -> 409.
-Sensitive object is never sent to the model or exported in telemetry.
+POST /v2/incidents                  create run (one model call) or replay
+POST /v2/incidents/{runId}/receipts apply tool outcomes / approvals (no model)
+GET  /v2/incidents/{runId}          current stored state
 """
 from __future__ import annotations
 
 import json
-import secrets
-import time
 from typing import Any, Optional
 
-from fastapi import Request
 from fastapi.responses import JSONResponse
 
 from . import store
-from .canonical import sha256_hex, canonical_str
+from .canonical import sha256_hex
 from .incident_planner import plan_incident
-from . import otlp
+from .otlp import Trace
 
-MAX_BODY = 768 * 1024
 PROFILE = "ga5-incident-agent/v2"
-
-NS_RUN = "q4_run"          # runId -> full run state
-NS_REQ = "q4_req"          # runId -> request content hash
+MAX_BODY = 768 * 1024
+NS_RUN = "q4_run"
+TERMINAL = ("completed", "failed")
 
 
 def _json(data: Any, status: int = 200) -> JSONResponse:
-    body = json.dumps(data).encode("utf-8")
-    if status == 200 and len(body) > MAX_BODY:
+    if status == 200 and len(json.dumps(data).encode()) > MAX_BODY:
         return JSONResponse({"error": "response too large"}, status_code=500)
     return JSONResponse(data, status_code=status)
 
 
-APPROVAL_TOOLS = {"rollback_deployment", "disable_feature"}
+def _bad(msg: str, status: int = 400) -> JSONResponse:
+    return JSONResponse({"error": msg}, status_code=status)
 
 
-def _rid(prefix: str) -> str:
-    return f"{prefix}_{secrets.token_hex(8)}"
+def _sid(*parts: Any) -> str:
+    return sha256_hex(list(parts))[:20]
 
 
-# --------------------------------------------------------------------------
-# POST /v2/incidents  — create/replay a run
-# --------------------------------------------------------------------------
-async def create_incident(request: Request) -> JSONResponse:
+# ====================================================================== create
+def create_incident(headers: dict, raw: bytes) -> JSONResponse:
     try:
-        body = await request.json()
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
-        return _json({"error": "invalid JSON"}, 400)
+        return _bad("invalid JSON")
     if not isinstance(body, dict):
-        return _json({"error": "invalid body"}, 400)
+        return _bad("invalid body")
     if body.get("profile") != PROFILE:
-        return _json({"error": "unsupported profile"}, 400)
+        return _bad("unsupported profile")
     run_id = body.get("runId")
-    incident = body.get("incident")
-    if not run_id or not isinstance(incident, dict):
-        return _json({"error": "invalid request"}, 422)
+    inc = body.get("incident")
+    catalog = body.get("toolCatalog")
+    policy = body.get("policy")
+    if not isinstance(run_id, str) or len(run_id) < 1 or not isinstance(inc, dict) \
+            or not isinstance(inc.get("transcript"), str) or not isinstance(inc.get("allowedRootCauses"), list) \
+            or not inc["allowedRootCauses"] or not isinstance(catalog, list) or not catalog \
+            or not isinstance(policy, dict):
+        return _bad("invalid incident request", 422)
 
-    # content hash excludes volatile per-run marker/canary/sensitive values but
-    # includes incident + policy + toolCatalog (the semantic request).
-    semantic = {
-        "incident": incident,
-        "policy": body.get("policy"),
-        "toolCatalog": body.get("toolCatalog"),
-        "agentName": body.get("agentName"),
-    }
-    content_hash = sha256_hex(semantic)
+    req_hash = sha256_hex(body)
+    with store.key_lock("q4:" + run_id):
+        run = store.get(NS_RUN, run_id)
+        if run is not None:
+            if run["requestHash"] != req_hash:
+                return _bad("run content conflict", 409)
+            return _json(run["firstResponse"])
 
-    with store.transaction():
-        prior_hash = store.get(NS_REQ, run_id)
-        if prior_hash is not None:
-            if prior_hash != content_hash:
-                return _json({"error": "run content conflict"}, 409)
-            run = store.get(NS_RUN, run_id)
-            return _json(_public_run(run))
+        sensitive = body.get("sensitive") if isinstance(body.get("sensitive"), dict) else {}
+        secret_values = [v for v in _flatten(sensitive) if isinstance(v, str)]
+        plan = plan_incident(inc, catalog, policy, secret_values)
 
-        run = _plan_new_run(body)
-        store.put(NS_REQ, run_id, content_hash)
+        tp = headers.get("traceparent") or body.get("traceparent")
+        ts = headers.get("tracestate") or body.get("tracestate")
+        trace = Trace.new(run_id, str(body.get("publicMarker", "")), str(body.get("agentName") or "incident-response"),
+                          plan.get("modelName", ""), tp, ts)
+        approval_needed = set(policy.get("approvalRequiredFor") or [])
+
+        run = {
+            "runId": run_id, "requestHash": req_hash, "status": "waiting",
+            "diagnosis": {"rootCause": plan["rootCause"], "evidence": plan["evidence"]},
+            "actions": {}, "order": [], "actionLog": [], "receiptLog": [], "suppressed": [],
+            "chosenEffect": None, "effect": None, "approval": None, "receipts": {},
+            "trace": trace.s,
+        }
+        diag_ids = []
+        new_dispatches = []
+        for i, d in enumerate(plan["diagnostics"]):
+            aid = "act-" + _sid(run_id, "diag", i, d["toolName"])
+            act = {"actionId": aid, "callId": "call-" + _sid(run_id, "diag-call", i, d["toolName"]),
+                   "phase": "diagnostic", "toolName": d["toolName"], "arguments": d["arguments"],
+                   "evidence": d["evidence"], "attempt": 0, "state": "pending"}
+            run["actions"][aid] = act
+            run["order"].append(aid)
+            diag_ids.append(aid)
+            new_dispatches.append(_dispatch(run, trace, act))
+        if len(diag_ids) > 1:
+            trace.add_join(diag_ids)
+        eff = plan.get("effect")
+        if eff and eff.get("toolName"):
+            aid = "act-" + _sid(run_id, "effect", eff["toolName"])
+            run["effect"] = {"actionId": aid, "callId": "call-" + _sid(run_id, "effect-call", eff["toolName"]),
+                             "phase": "effect", "toolName": eff["toolName"], "arguments": eff["arguments"],
+                             "evidence": eff["evidence"], "attempt": 0, "state": "planned",
+                             "needsApproval": eff["toolName"] in approval_needed}
+        if not diag_ids:
+            new_dispatches = _advance(run, trace)
+        run["trace"] = trace.s
+        resp = _view(run, new_dispatches)
+        run["firstResponse"] = resp
         store.put(NS_RUN, run_id, run)
-        return _json(_public_run(run))
+        return _json(resp)
 
 
-def _plan_new_run(body: dict) -> dict:
-    run_id = body["runId"]
-    incident = body["incident"]
-    policy = body.get("policy", {}) or {}
-    catalog = body.get("toolCatalog", []) or []
-    public_marker = body.get("publicMarker", "")
-    agent_name = body.get("agentName", "incident-response")
-
-    # incoming trace context
-    tp = None
-    headers_tp = body.get("traceparent")  # may be absent
-
-    # MODEL CALL (the only one): diagnosis + plan. sensitive is NEVER passed.
-    plan = plan_incident(incident, catalog, policy)
-    root_cause = plan["rootCause"]
-    evidence = plan["evidence"]
-    diagnostics = plan["diagnostics"]   # list of {toolName, arguments, evidence}
-    effect = plan.get("effect")         # {toolName, arguments, evidence} or None
-    model_name = plan.get("modelName", "")
-
-    approval_required = set(policy.get("approvalRequiredFor", []))
-
-    # Build OTLP trace skeleton (trace id + server/agent/model spans).
-    trace = otlp.new_trace(run_id, public_marker)
-    trace.start_server()
-    trace.start_agent(agent_name)
-    trace.add_model_span(model_name)
-
-    dispatches = []
-    approvals = []
-
-    # If the planned EFFECT needs approval, first return an approval request and
-    # zero effect dispatches. Diagnostics still run first though.
-    # Phase 1 is always diagnostics (unless none needed).
-    pending = []
-    for d in diagnostics:
-        action_id = _rid("act")
-        call_id = _rid("call")
-        client_span = trace.add_tool_client(action_id, d["toolName"], call_id,
-                                            attempt=1)
-        dispatches.append({
-            "actionId": action_id, "callId": call_id,
-            "phase": "diagnostic", "toolName": d["toolName"],
-            "arguments": d["arguments"], "evidence": d["evidence"],
-            "attempt": 1,
-            "traceparent": trace.traceparent(client_span),
-        })
-        pending.append({"actionId": action_id, "callId": call_id,
-                        "toolName": d["toolName"], "attempt": 1,
-                        "phase": "diagnostic", "status": "pending"})
-
-    if len(diagnostics) > 1:
-        trace.add_join([d["_client_span"] for d in trace.diag_clients])
-
-    run = {
-        "runId": run_id,
-        "status": "waiting",
-        "agentName": agent_name,
-        "publicMarker": public_marker,
-        "diagnosis": {"rootCause": root_cause, "evidence": evidence},
-        "plannedEffect": effect,
-        "approvalRequired": effect is not None
-            and effect.get("toolName") in approval_required,
-        "approvalRequestedId": None,
-        "effectActionId": None,
-        "pending": pending,
-        "dispatches": dispatches,
-        "approvals": approvals,
-        "actionLog": list(dispatches),
-        "receiptLog": [],
-        "suppressed": [],
-        "chosenEffect": None,
-        "trace": trace.dump(),
-        "_trace_state": trace.serialize(),
-    }
-    return run
+def _flatten(o: Any):
+    if isinstance(o, dict):
+        for v in o.values():
+            yield from _flatten(v)
+    elif isinstance(o, list):
+        for v in o:
+            yield from _flatten(v)
+    else:
+        yield o
 
 
-# --------------------------------------------------------------------------
-# POST /v2/incidents/{runId}/receipts
-# --------------------------------------------------------------------------
-async def post_receipts(request: Request, run_id: str) -> JSONResponse:
+def _dispatch(run: dict, trace: Trace, act: dict, approval: Optional[dict] = None) -> dict:
+    act["attempt"] += 1
+    act["state"] = "pending"
+    span_id = trace.tool_attempt(act["actionId"], act["callId"], act["toolName"], act["attempt"])
+    d = {"actionId": act["actionId"], "callId": act["callId"], "phase": act["phase"],
+         "toolName": act["toolName"], "arguments": act["arguments"], "evidence": act["evidence"],
+         "attempt": act["attempt"], "traceparent": trace.traceparent(span_id)}
+    if trace.tracestate:
+        d["tracestate"] = trace.tracestate
+    if approval:
+        d["approvalId"] = approval["approvalId"]
+        d["approvalNonce"] = approval["nonce"]
+    run["actionLog"].append(d)
+    return d
+
+
+# ====================================================================== receipts
+def post_receipts(run_id: str, raw: bytes) -> JSONResponse:
     try:
-        body = await request.json()
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
-        return _json({"error": "invalid JSON"}, 400)
+        return _bad("invalid JSON")
+    if not isinstance(body, dict) or not isinstance(body.get("receiptId"), str) or not body["receiptId"]:
+        return _bad("receiptId required", 422)
+    outcomes, approvals = body.get("outcomes"), body.get("approvals")
+    if (outcomes is None) == (approvals is None) or not isinstance(outcomes or approvals, list) \
+            or not (outcomes or approvals):
+        return _bad("exactly one of outcomes/approvals required", 422)
 
-    with store.transaction():
+    with store.key_lock("q4:" + run_id):
         run = store.get(NS_RUN, run_id)
         if run is None:
-            return _json({"error": "unknown run"}, 404)
-
-        receipt_id = body.get("receiptId")
-        # replay detection: same receiptId with same content -> same state
-        rkey = f"{run_id}:receipt:{receipt_id}"
-        prior = store.get("q4_receipt_seen", rkey)
-        cur_hash = sha256_hex(body)
+            return _bad("unknown run", 404)
+        rid = body["receiptId"]
+        h = sha256_hex(body)
+        prior = run["receipts"].get(rid)
         if prior is not None:
-            if prior["hash"] != cur_hash:
-                return _json({"error": "receipt content conflict"}, 409)
-            return _json(_public_run(run))
+            if prior["hash"] != h:
+                return _bad("receipt content conflict", 409)
+            return _json(prior["response"])
+        if run["status"] in TERMINAL:
+            return _bad("run already terminal", 409)
 
-        trace = otlp.Trace.deserialize(run["_trace_state"])
-
-        # approval receipts
-        approvals = body.get("approvals")
-        outcomes = body.get("outcomes")
-
-        if approvals:
-            run = _apply_approval(run, trace, receipt_id, approvals)
-        elif outcomes:
-            run = _apply_outcomes(run, trace, receipt_id, outcomes)
+        trace = Trace(run["trace"])
+        if outcomes is not None:
+            err = _check_outcomes(run, outcomes)
+            if err:
+                return _bad(err, 422)
+            new = _apply_outcomes(run, trace, rid, outcomes)
         else:
-            return _json({"error": "empty receipt"}, 400)
-
-        run["_trace_state"] = trace.serialize()
-        run["trace"] = trace.dump()
+            err = _check_approvals(run, approvals)
+            if err:
+                return _bad(err, 422)
+            new = _apply_approval(run, trace, rid, approvals[0])
+        run["trace"] = trace.s
+        resp = _view(run, new)
+        run["receipts"][rid] = {"hash": h, "response": resp}
         store.put(NS_RUN, run_id, run)
-        store.put("q4_receipt_seen", rkey, {"hash": cur_hash})
-        return _json(_public_run(run))
+        return _json(resp)
 
 
-def _apply_outcomes(run: dict, trace, receipt_id: str, outcomes: list) -> dict:
-    pending = {(p["actionId"], p["callId"], p["attempt"]): p
-               for p in run["pending"] if p["status"] == "pending"}
+def _pending(run: dict) -> dict:
+    acts = list(run["actions"].values()) + ([run["effect"]] if run.get("effect") else [])
+    return {(a["actionId"], a["callId"], a["attempt"]): a for a in acts if a["state"] == "pending"}
+
+
+def _check_outcomes(run: dict, outcomes: list) -> Optional[str]:
+    pend = _pending(run)
+    seen = set()
     for o in outcomes:
-        key = (o.get("actionId"), o.get("callId"), o.get("attempt", 1))
-        p = pending.get(key)
-        if p is None:
-            continue  # accept only pending calls
-        status = o.get("status")
-        result_class = o.get("resultClass")
-        err = o.get("errorType")
-        nonce = o.get("nonce")
-        # record receipt in log + trace client span fields
-        run["receiptLog"].append({
-            "receiptId": receipt_id, "actionId": p["actionId"],
-            "callId": p["callId"], "attempt": p["attempt"],
-            "status": status, "resultClass": result_class, "nonce": nonce,
-        })
-        trace.record_receipt_on_client(p["actionId"], p["attempt"],
-                                       receipt_id, nonce, status, err)
-        if status == 503:
-            # exactly one retry with new CLIENT span, attempt+1
-            if p["attempt"] == 1:
-                p["status"] = "retried"
-                new_attempt = 2
-                client_span = trace.add_tool_client(
-                    p["actionId"], p["toolName"], p["callId"],
-                    attempt=new_attempt)
-                disp = {
-                    "actionId": p["actionId"], "callId": p["callId"],
-                    "phase": p["phase"], "toolName": p["toolName"],
-                    "arguments": {}, "evidence": [], "attempt": new_attempt,
-                    "traceparent": trace.traceparent(client_span),
-                }
-                run["dispatches"].append(disp)
-                run["actionLog"].append(disp)
-                run["pending"].append({
-                    "actionId": p["actionId"], "callId": p["callId"],
-                    "toolName": p["toolName"], "attempt": new_attempt,
-                    "phase": p["phase"], "status": "pending"})
-            else:
-                p["status"] = "failed"
-        elif status == 0 and err == "timeout":
-            p["status"] = "timeout"
-            # dependent effect must NOT be sent
-            run["suppressed"].append({"reason": "prerequisite_timeout",
-                                      "actionId": p["actionId"]})
-        elif result_class == "diagnosis_confirmed" or status == 200:
-            p["status"] = "confirmed"
+        if not isinstance(o, dict):
+            return "invalid outcome"
+        key = (o.get("actionId"), o.get("callId"), o.get("attempt"))
+        if key not in pend or key in seen:
+            return "outcome does not match a pending call"
+        if not isinstance(o.get("status"), int):
+            return "outcome status must be an integer"
+        seen.add(key)
+    return None
+
+
+def _apply_outcomes(run: dict, trace: Trace, rid: str, outcomes: list) -> list:
+    pend = _pending(run)
+    new = []
+    for o in outcomes:
+        act = pend[(o["actionId"], o["callId"], o["attempt"])]
+        entry = {"receiptId": rid, "actionId": act["actionId"], "callId": act["callId"],
+                 "attempt": act["attempt"], "status": o["status"], "resultClass": o.get("resultClass"),
+                 "nonce": o.get("nonce")}
+        if o.get("errorType") is not None:
+            entry["errorType"] = o["errorType"]
+        run["receiptLog"].append(entry)
+        status, err = o["status"], o.get("errorType")
+        trace.record_outcome(act["actionId"], act["attempt"], rid, o.get("nonce"), status, err)
+        if status == 503 and act["attempt"] == 1:
+            new.append(_dispatch(run, trace, act))          # exactly one retry
+        elif status == 0 or err == "timeout":
+            act["state"] = "timeout"
+        elif 200 <= status < 300:
+            act["state"] = "done"
         else:
-            p["status"] = "done"
+            act["state"] = "failed"
+    if not any(d for d in new):
+        new += _advance(run, trace)
+    else:
+        # retries outstanding; never include approval requests in a retry response
+        pass
+    return new
 
-    return _maybe_emit_effect(run, trace)
 
-
-def _maybe_emit_effect(run: dict, trace) -> dict:
-    # First: if an effect has already been dispatched, resolve by its status.
-    effect_pending = [p for p in run["pending"] if p["phase"] == "effect"]
-    if effect_pending:
-        still_open = [p for p in effect_pending if p["status"] == "pending"]
-        if still_open:
-            return run  # waiting on effect receipt
-        failed = any(p["status"] in ("failed", "timeout") for p in effect_pending)
-        run["status"] = "failed" if failed else "completed"
-        return _finalize(run, trace)
-
-    # if all diagnostics resolved and none timed out, emit the effect
-    diag = [p for p in run["pending"] if p["phase"] == "diagnostic"]
-    active = [p for p in diag if p["status"] == "pending"]
-    if active:
-        return run  # still waiting
-    timed_out = any(p["status"] == "timeout" for p in diag)
-    effect = run.get("plannedEffect")
-
-    if timed_out:
+def _advance(run: dict, trace: Trace) -> list:
+    diags = list(run["actions"].values())
+    if any(a["state"] == "pending" for a in diags):
+        return []
+    eff = run.get("effect")
+    if any(a["state"] != "done" for a in diags):
         run["status"] = "failed"
-        run["chosenEffect"] = None
-        return _finalize(run, trace)
-
-    if effect is None:
+        if eff and eff["state"] == "planned":
+            eff["state"] = "suppressed"
+            reason = "prerequisite_timeout" if any(a["state"] == "timeout" for a in diags) \
+                else "prerequisite_failed"
+            run["suppressed"].append({"actionId": eff["actionId"], "toolName": eff["toolName"],
+                                      "reason": reason})
+        run["approval"] = None
+        return []
+    if eff is None:
         run["status"] = "completed"
-        return _finalize(run, trace)
-
-    # effect requires approval?
-    if run.get("approvalRequired") and run.get("approvalRequestedId") is None:
-        approval_id = _rid("apr")
-        action_id = _rid("act")
-        run["approvalRequestedId"] = approval_id
-        run["effectActionId"] = action_id
-        digest = sha256_hex(effect.get("arguments", {}))
-        run["approvals"] = [{
-            "approvalId": approval_id, "actionId": action_id,
-            "toolName": effect["toolName"], "argumentsDigest": digest,
-        }]
-        run["dispatches"] = []  # zero effect dispatches until approved
-        trace.add_approval_gate(approval_id)
-        run["status"] = "waiting"
-        return run
-
-    # no approval needed -> dispatch effect now
-    return _dispatch_effect(run, trace)
+        return []
+    if eff["state"] == "planned":
+        if eff["needsApproval"] and not (run.get("approval") or {}).get("nonce"):
+            if run.get("approval") is None:
+                appr = {"approvalId": "apr-" + _sid(run["runId"], "approval", eff["actionId"]),
+                        "actionId": eff["actionId"], "toolName": eff["toolName"],
+                        "argumentsDigest": sha256_hex(eff["arguments"])}
+                run["approval"] = dict(appr, nonce=None, pending=True)
+                trace.add_gate(appr["approvalId"], eff["actionId"])
+            return []
+        run["chosenEffect"] = eff["toolName"]
+        return [_dispatch(run, trace, eff, run.get("approval") if eff["needsApproval"] else None)]
+    if eff["state"] == "pending":
+        return []
+    run["status"] = "completed" if eff["state"] == "done" else "failed"
+    run["approval"] = None if run["status"] in TERMINAL else run.get("approval")
+    return []
 
 
-def _dispatch_effect(run: dict, trace, approval_nonce: Optional[str] = None) -> dict:
-    effect = run["plannedEffect"]
-    action_id = run.get("effectActionId") or _rid("act")
-    call_id = _rid("call")
-    client_span = trace.add_tool_client(action_id, effect["toolName"], call_id,
-                                        attempt=1)
-    disp = {
-        "actionId": action_id, "callId": call_id,
-        "phase": "effect", "toolName": effect["toolName"],
-        "arguments": effect.get("arguments", {}),
-        "evidence": effect.get("evidence", []),
-        "attempt": 1,
-        "traceparent": trace.traceparent(client_span),
-    }
-    if approval_nonce:
-        disp["approvalId"] = run.get("approvalRequestedId")
-        disp["approvalNonce"] = approval_nonce
-    run["dispatches"] = [disp]
-    run["actionLog"].append(disp)
-    run["pending"].append({
-        "actionId": action_id, "callId": call_id,
-        "toolName": effect["toolName"], "attempt": 1,
-        "phase": "effect", "status": "pending"})
-    run["chosenEffect"] = effect["toolName"]
-    run["status"] = "waiting"
-    return run
+def _check_approvals(run: dict, approvals: list) -> Optional[str]:
+    appr = run.get("approval")
+    if not appr or not appr.get("pending") or len(approvals) != 1 or not isinstance(approvals[0], dict):
+        return "no matching pending approval"
+    a = approvals[0]
+    if a.get("approvalId") != appr["approvalId"] or a.get("decision") not in ("approved", "rejected", "denied"):
+        return "approval does not match pending request"
+    if a["decision"] == "approved" and not a.get("nonce"):
+        return "approval nonce required"
+    return None
 
 
-def _apply_approval(run: dict, trace, receipt_id: str, approvals: list) -> dict:
-    for a in approvals:
-        if a.get("approvalId") != run.get("approvalRequestedId"):
-            continue
-        if a.get("decision") != "approved":
-            run["status"] = "failed"
-            return _finalize(run, trace)
-        nonce = a.get("nonce")
-        run["receiptLog"].append({
-            "receiptId": receipt_id, "approvalId": a["approvalId"],
-            "decision": "approved", "nonce": nonce,
-        })
-        trace.record_approval(a["approvalId"], nonce)
-        return _dispatch_effect(run, trace, approval_nonce=nonce)
-    return run
+def _apply_approval(run: dict, trace: Trace, rid: str, a: dict) -> list:
+    appr = run["approval"]
+    run["receiptLog"].append({"receiptId": rid, "approvalId": appr["approvalId"],
+                              "decision": a["decision"], "nonce": a.get("nonce")})
+    trace.record_approval(rid, a.get("nonce"), a["decision"])
+    appr["pending"] = False
+    eff = run["effect"]
+    if a["decision"] != "approved":
+        eff["state"] = "suppressed"
+        run["suppressed"].append({"actionId": eff["actionId"], "toolName": eff["toolName"],
+                                  "reason": "approval_denied"})
+        run["status"] = "failed"
+        return []
+    appr["nonce"] = a["nonce"]
+    run["chosenEffect"] = eff["toolName"]
+    return [_dispatch(run, trace, eff, appr)]
 
 
-def _finalize(run: dict, trace) -> dict:
-    # effect confirmed?
-    effect_pending = [p for p in run["pending"]
-                      if p["phase"] == "effect" and p["status"] == "pending"]
-    if not effect_pending and run["status"] not in ("failed",):
-        run["status"] = "completed"
-    run["dispatches"] = []
-    run["approvals"] = []
-    return run
-
-
-# --------------------------------------------------------------------------
-# GET /v2/incidents/{runId}
-# --------------------------------------------------------------------------
-def get_incident(run_id: str) -> JSONResponse:
-    run = store.get(NS_RUN, run_id)
-    if run is None:
-        return _json({"error": "unknown run"}, 404)
-    return _json(_public_run(run))
-
-
-def _public_run(run: dict) -> dict:
-    terminal = run["status"] in ("completed", "failed")
-    out = {
-        "runId": run["runId"],
-        "status": run["status"],
-        "diagnosis": run["diagnosis"],
-        "chosenEffect": run.get("chosenEffect"),
-        "suppressed": run.get("suppressed", []),
-        "actionLog": run.get("actionLog", []),
-        "receiptLog": run.get("receiptLog", []),
-        "otlp": run["trace"],
-    }
-    if terminal:
+# ====================================================================== views
+def _view(run: dict, new_dispatches: list) -> dict:
+    out = {"runId": run["runId"], "status": run["status"], "diagnosis": run["diagnosis"]}
+    if run["status"] in TERMINAL:
         out["dispatches"] = []
         out["approvals"] = []
     else:
-        out["dispatches"] = run.get("dispatches", [])
-        out["approvals"] = run.get("approvals", [])
+        out["dispatches"] = new_dispatches
+        appr = run.get("approval")
+        out["approvals"] = ([{k: appr[k] for k in ("approvalId", "actionId", "toolName", "argumentsDigest")}]
+                            if appr and appr.get("pending") and not new_dispatches else [])
+    out["chosenEffect"] = run.get("chosenEffect")
+    out["suppressed"] = run["suppressed"]
+    out["actionLog"] = run["actionLog"]
+    out["receiptLog"] = run["receiptLog"]
+    out["otlp"] = Trace(run["trace"]).dump()
     return out
+
+
+def get_incident(run_id: str) -> JSONResponse:
+    run = store.get(NS_RUN, run_id)
+    if run is None:
+        return _bad("unknown run", 404)
+    pending = [d for d in run["actionLog"]
+               if (d["actionId"], d["callId"], d["attempt"]) in _pending(run)]
+    return _json(_view(run, pending))

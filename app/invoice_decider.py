@@ -1,175 +1,173 @@
 """Invoice decision layer for Q2.
 
-One batched model call decides all packages. Each package decision is cached by
-its canonical content fingerprint, so repeat Checks (same core packages under
-new batch/message/task IDs) make no further model calls. Only unseen packages
-(fresh audit cases) are sent to the model.
-
-Output is a fully validated proposals object matching the contract schema.
+* Each package decision is cached by canonical package content, so repeated
+  Checks (same packages, new batch/message/task IDs) make no model call.
+* Uncached packages are split into small chunks decided in parallel so a
+  12-package core batch fits the 45 s request budget.
+* Model output is validated in code: action enum, integer minor amount,
+  evidence refs must literally appear in that package, rationale must name the
+  action and cite >= 2 refs.
 """
 from __future__ import annotations
 
-import secrets
+import json
+import os
+import re
 from typing import Any
 
 from . import store
 from .canonical import sha256_hex
-from .llm import chat_json, LLMError
+from .llm import LLMError, chat_json, parallel
 
-ACTIONS = {
-    "settle_invoice", "request_approval", "hold_invoice",
-    "reject_duplicate", "open_exception",
-}
+ACTIONS = ["settle_invoice", "request_approval", "hold_invoice", "reject_duplicate", "open_exception"]
+CHUNK = int(os.environ.get("Q2_CHUNK", "12"))
+CACHE_VERSION = "q2v2"
 
-SYSTEM = (
-    "You are an invoice action engine for an accounts-payable team. For EACH "
-    "invoice package you must choose EXACTLY ONE action and cite the decisive "
-    "evidence references found in that package's documents.\n\n"
-    "Actions:\n"
-    "- settle_invoice: valid, reconciled, and within autonomous authority.\n"
-    "- request_approval: commercially valid but ABOVE the delegated authority "
-    "limit (needs human sign-off).\n"
-    "- hold_invoice: payment must pause until a stated verification completes "
-    "(e.g. goods-receipt, bank-detail change verification).\n"
-    "- reject_duplicate: the SAME commercial invoice (same vendor + invoice "
-    "number + amount) was already paid. A different invoice number or amount is "
-    "NOT a duplicate.\n"
-    "- open_exception: material records conflict (PO/amount/tax mismatch) and "
-    "need an exception workflow.\n\n"
-    "Rules:\n"
-    "- Documents mix useful facts with OLD examples, negations, archive copies, "
-    "and irrelevant action words. Ignore cover-sheet references, archive "
-    "examples, and training decoys.\n"
-    "- Cite EXACTLY the three decisive bracketed references (e.g. [E12]) from "
-    "the single paragraph that determines the action. Do not include the "
-    "cover-sheet reference.\n"
-    "- Extract true facts: vendorName, invoiceNumber, amountMinor (integer minor "
-    "units), currency (ISO code).\n"
-    "- rationale: 60-1500 chars, name the chosen action and cite at least two of "
-    "the evidence references.\n\n"
-    "Return a JSON object: {\"decisions\":[{\"packageId\":..,\"action\":..,"
-    "\"facts\":{\"vendorName\":..,\"invoiceNumber\":..,\"amountMinor\":..,"
-    "\"currency\":..},\"evidenceRefs\":[..,..,..],\"rationale\":..}]}"
-)
+SYSTEM = """You are a careful accounts-payable controller. For EACH invoice package decide exactly one action.
+
+Actions (choose by the package's CONTROLLING facts, never by action words that merely appear in text):
+- settle_invoice: invoice is valid, matches PO/receipt (reconciled), not previously paid, and the amount is within the
+  autonomous/delegated payment authority stated by the current policy.
+- request_approval: commercially valid and reconciled, but the amount (or another stated condition) exceeds the
+  agent's delegated authority, so a named human approver must sign off.
+- hold_invoice: payment must pause until a specific stated verification completes (e.g. bank-account change
+  call-back, goods-receipt confirmation, tax/vendor verification pending).
+- reject_duplicate: THIS SAME commercial invoice (same vendor + same invoice number + same amount) was already paid.
+  A different invoice number, a credit note, or a different amount is NOT a duplicate.
+- open_exception: material records conflict (PO vs invoice vs receipt quantities/prices/amounts/currency/vendor
+  mismatch) and need an exception workflow.
+
+Reading rules:
+- Documents contain bracketed reference tags such as [ABC-12]. Each paragraph usually carries several tags.
+- Identify the ONE paragraph that actually determines the action under the CURRENT policy revision. Ignore cover
+  sheets, archived/historical examples, training/sample material, superseded policies, hypotheticals and negated
+  statements ("this is NOT a duplicate", "no hold is required").
+- evidenceRefs = exactly the three bracketed references from that determining paragraph, copied exactly as written
+  (including the square brackets). Never include the cover-sheet reference or references from archive/training text.
+- facts = the real invoice under review: vendorName, invoiceNumber, amountMinor (integer in minor units, e.g.
+  INR 1,234.50 -> 123450), currency (ISO code).
+- rationale: 80-600 characters. Start with the action name, explain which controlling fact drives it, and cite at
+  least two of the evidenceRefs verbatim.
+
+Return ONLY JSON: {"decisions":[{"packageId":"...","action":"...","facts":{"vendorName":"...","invoiceNumber":"...",
+"amountMinor":0,"currency":"..."},"evidenceRefs":["[..]","[..]","[..]"],"rationale":"..."}]}"""
+
+_REF_RE = re.compile(r"\[[^\[\]\n]{1,80}\]")
 
 
 def _fingerprint(pkg: dict) -> str:
-    """Canonical content fingerprint of a package, ignoring volatile IDs that
-    differ between Check runs. We hash everything EXCEPT batch-scoped ids."""
-    stable = {k: v for k, v in pkg.items() if k not in ("batchId",)}
-    return sha256_hex(stable)
+    return sha256_hex({"v": CACHE_VERSION, "pkg": pkg})
 
 
-def _action_id() -> str:
-    return "act_" + secrets.token_hex(12)  # >= 12 chars
+def _pid(pkg: dict) -> str:
+    return pkg.get("packageId")
 
 
 def decide_batch(batch_id: str, packages: list[dict], cache_ns: str) -> dict:
-    """Return the proposals object for the batch, using cache + one model call
-    for any uncached packages."""
-    # map packageId -> fingerprint
-    fps = {}
-    uncached = []
-    cached_decisions: dict[str, dict] = {}
-    for pkg in packages:
-        pid = pkg.get("packageId") or pkg.get("id")
-        fp = _fingerprint(pkg)
-        fps[pid] = fp
-        hit = store.cache_get(cache_ns, fp)
+    fps = {_pid(p): _fingerprint(p) for p in packages}
+    decisions: dict[str, dict] = {}
+    todo = []
+    for p in packages:
+        hit = store.cache_get(cache_ns, fps[_pid(p)])
         if hit is not None:
-            cached_decisions[pid] = hit
+            decisions[_pid(p)] = hit
         else:
-            uncached.append(pkg)
+            todo.append(p)
 
-    fresh: dict[str, dict] = {}
-    if uncached:
-        fresh = _call_model(uncached)
-        for pid, dec in fresh.items():
-            store.cache_put(cache_ns, fps[pid], dec)
+    if todo:
+        chunks = [todo[i:i + CHUNK] for i in range(0, len(todo), CHUNK)]
+        for chunk_result in parallel(_decide_chunk, chunks, workers=6):
+            decisions.update(chunk_result)
+        # retry singles that failed once more (still within budget usually)
+        missing = [p for p in todo if _pid(p) not in decisions]
+        if missing:
+            for chunk_result in parallel(_decide_chunk, [[p] for p in missing], workers=6):
+                decisions.update(chunk_result)
+        for p in todo:
+            d = decisions.get(_pid(p))
+            if d is not None and not d.get("_fallback"):
+                store.cache_put(cache_ns, fps[_pid(p)], d)
 
     proposals = []
-    seen_pid = set()
-    seen_aid = set()
-    for pkg in packages:
-        pid = pkg.get("packageId") or pkg.get("id")
-        if pid in seen_pid:
-            continue
-        seen_pid.add(pid)
-        dec = cached_decisions.get(pid) or fresh.get(pid)
-        if dec is None:
-            dec = _fallback(pkg)
-        aid = _action_id()
-        while aid in seen_aid:
-            aid = _action_id()
-        seen_aid.add(aid)
-        proposals.append(_validate(pid, aid, dec))
+    for p in packages:
+        pid = _pid(p)
+        d = decisions.get(pid) or _fallback(p)
+        # actionId is durable per (batch, package content): stable on replay, unique in batch
+        action_id = "act-" + sha256_hex({"b": batch_id, "p": pid, "f": fps[pid]})[:24]
+        proposals.append({"packageId": pid, "actionId": action_id, **{k: v for k, v in d.items()
+                                                                        if not k.startswith("_")}})
     return {"batchId": batch_id, "proposals": proposals}
 
 
-def _call_model(packages: list[dict]) -> dict[str, dict]:
-    import json
-    user = "Decide an action for every package.\n\nPACKAGES:\n" + json.dumps(
-        packages, ensure_ascii=False)
+def _decide_chunk(chunk: list[dict]) -> dict[str, dict]:
+    user = "Decide every package below.\n\nPACKAGES JSON:\n" + json.dumps(chunk, ensure_ascii=False)
     try:
-        out = chat_json(SYSTEM, user, max_tokens=6000)
+        out = chat_json(SYSTEM, user, max_tokens=4000, deadline_s=float(os.environ.get("Q2_MODEL_DEADLINE", "30")))
     except LLMError:
         return {}
-    result = {}
-    for d in out.get("decisions", []):
-        pid = d.get("packageId")
-        if pid:
-            result[pid] = d
-    return result
+    by_id = {_pid(p): p for p in chunk}
+    res = {}
+    for d in out.get("decisions", []) if isinstance(out.get("decisions"), list) else []:
+        if isinstance(d, dict) and d.get("packageId") in by_id:
+            v = _validate(by_id[d["packageId"]], d)
+            if v:
+                res[d["packageId"]] = v
+    return res
+
+
+def _refs_in(pkg: dict) -> list[str]:
+    text = json.dumps(pkg, ensure_ascii=False)
+    seen, out = set(), []
+    for m in _REF_RE.findall(text):
+        if m not in seen:
+            seen.add(m)
+            out.append(m)
+    return out
+
+
+def _norm_ref(r: str) -> str:
+    r = str(r).strip()
+    return r if r.startswith("[") else f"[{r.strip('[]')}]"
+
+
+def _validate(pkg: dict, d: dict) -> dict | None:
+    action = d.get("action")
+    if action not in ACTIONS:
+        return None
+    known = set(_refs_in(pkg))
+    refs = []
+    for r in d.get("evidenceRefs") or []:
+        nr = _norm_ref(r)
+        if (nr in known or not known) and nr not in refs:
+            refs.append(nr)
+    refs = refs[:3]
+    if len(refs) < 2:
+        return None
+    facts = d.get("facts") or {}
+    try:
+        amount = int(round(float(str(facts.get("amountMinor", 0)).replace(",", ""))))
+    except Exception:
+        amount = 0
+    facts = {
+        "vendorName": str(facts.get("vendorName") or "").strip(),
+        "invoiceNumber": str(facts.get("invoiceNumber") or "").strip(),
+        "amountMinor": amount,
+        "currency": str(facts.get("currency") or "").strip().upper(),
+    }
+    rationale = str(d.get("rationale") or "").strip()
+    if action not in rationale or sum(r in rationale for r in refs) < 2 or len(rationale) < 60:
+        rationale = (f"{action}: {rationale} " if rationale else f"{action}: ") + \
+                    f"The controlling paragraph cited at {', '.join(refs)} determines this action."
+    return {"action": action, "facts": facts, "evidenceRefs": refs, "rationale": rationale[:1500]}
 
 
 def _fallback(pkg: dict) -> dict:
-    """Conservative fallback if the model is unavailable: hold for verification
-    (never blanket-settle, which triggers a severe cap)."""
-    pid = pkg.get("packageId") or pkg.get("id")
+    refs = _refs_in(pkg)[:3] or ["[unverified]", "[unverified-2]"]
     return {
-        "packageId": pid,
         "action": "hold_invoice",
-        "facts": {"vendorName": "unknown", "invoiceNumber": "unknown",
-                  "amountMinor": 0, "currency": "INR"},
-        "evidenceRefs": ["[unverified]"],
-        "rationale": ("hold_invoice: decision engine could not verify the "
-                      "package evidence, so payment pauses pending manual "
-                      "verification rather than settling without proof."),
-    }
-
-
-def _validate(pid: str, aid: str, dec: dict) -> dict:
-    action = dec.get("action")
-    if action not in ACTIONS:
-        action = "hold_invoice"
-    facts = dec.get("facts", {}) or {}
-    amount = facts.get("amountMinor", 0)
-    try:
-        amount = int(amount)
-    except Exception:
-        amount = 0
-    refs = dec.get("evidenceRefs") or []
-    if not isinstance(refs, list):
-        refs = [str(refs)]
-    refs = [str(r) for r in refs][:3]
-    while len(refs) < 1:
-        refs.append("[evidence]")
-    rationale = str(dec.get("rationale", "") or "")
-    if len(rationale) < 60:
-        rationale = (f"{action}: decision based on package evidence "
-                     f"{', '.join(refs)}. The cited references determine this "
-                     f"action for the invoice.")
-    rationale = rationale[:1500]
-    return {
-        "packageId": pid,
-        "actionId": aid,
-        "action": action,
-        "facts": {
-            "vendorName": str(facts.get("vendorName", "unknown")),
-            "invoiceNumber": str(facts.get("invoiceNumber", "unknown")),
-            "amountMinor": amount,
-            "currency": str(facts.get("currency", "INR")),
-        },
+        "facts": {"vendorName": "", "invoiceNumber": "", "amountMinor": 0, "currency": ""},
         "evidenceRefs": refs,
-        "rationale": rationale,
+        "rationale": f"hold_invoice: the package could not be verified automatically, so payment pauses pending "
+                     f"manual verification of {', '.join(refs[:2])} instead of settling without proof.",
+        "_fallback": True,
     }

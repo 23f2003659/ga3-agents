@@ -1,7 +1,10 @@
-"""Durable storage: SQLite with a simple namespaced key/value API plus a
-content-addressed decision cache. Writes are committed before the handler
-responds (contract: 'store state before responding'). A process-wide lock
-serializes writes so concurrent equivalent requests cannot double-apply.
+"""Durable storage: SQLite key/value + content-addressed decision cache.
+
+* Writes commit before handlers respond ("store state before responding").
+* `_db_lock` only guards short SQLite operations.
+* `key_lock(name)` gives a per-entity lock (task, evaluation, run) so slow model
+  calls for one entity never block unrelated requests, while concurrent
+  equivalent requests for the same entity are serialized (no double work).
 """
 from __future__ import annotations
 
@@ -9,11 +12,15 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from typing import Any, Optional
 
 _DB_PATH = os.environ.get("DB_PATH", "state.db")
-_lock = threading.RLock()
+_db_lock = threading.RLock()
 _conn: Optional[sqlite3.Connection] = None
+
+_key_locks: dict[str, threading.Lock] = {}
+_key_locks_guard = threading.Lock()
 
 
 def _db() -> sqlite3.Connection:
@@ -22,82 +29,64 @@ def _db() -> sqlite3.Connection:
         _conn = sqlite3.connect(_DB_PATH, check_same_thread=False)
         _conn.execute("PRAGMA journal_mode=WAL;")
         _conn.execute("PRAGMA synchronous=NORMAL;")
-        _conn.execute(
-            "CREATE TABLE IF NOT EXISTS kv ("
-            "ns TEXT NOT NULL, k TEXT NOT NULL, v TEXT NOT NULL, "
-            "PRIMARY KEY (ns, k))"
-        )
-        _conn.execute(
-            "CREATE TABLE IF NOT EXISTS cache ("
-            "ns TEXT NOT NULL, fingerprint TEXT NOT NULL, v TEXT NOT NULL, "
-            "PRIMARY KEY (ns, fingerprint))"
-        )
+        _conn.execute("CREATE TABLE IF NOT EXISTS kv (ns TEXT NOT NULL, k TEXT NOT NULL, "
+                      "v TEXT NOT NULL, PRIMARY KEY (ns, k))")
+        _conn.execute("CREATE TABLE IF NOT EXISTS cache (ns TEXT NOT NULL, fingerprint TEXT NOT NULL, "
+                      "v TEXT NOT NULL, PRIMARY KEY (ns, fingerprint))")
+        _conn.execute("CREATE TABLE IF NOT EXISTS capture (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                      "ts REAL, v TEXT NOT NULL)")
         _conn.commit()
     return _conn
 
 
+def key_lock(name: str) -> threading.Lock:
+    with _key_locks_guard:
+        lk = _key_locks.get(name)
+        if lk is None:
+            lk = _key_locks[name] = threading.Lock()
+        return lk
+
+
 def get(ns: str, key: str) -> Optional[Any]:
-    with _lock:
-        cur = _db().execute("SELECT v FROM kv WHERE ns=? AND k=?", (ns, key))
-        row = cur.fetchone()
+    with _db_lock:
+        row = _db().execute("SELECT v FROM kv WHERE ns=? AND k=?", (ns, key)).fetchone()
     return json.loads(row[0]) if row else None
 
 
 def put(ns: str, key: str, value: Any) -> None:
-    with _lock:
-        _db().execute(
-            "INSERT OR REPLACE INTO kv (ns,k,v) VALUES (?,?,?)",
-            (ns, key, json.dumps(value)),
-        )
-        _db().commit()
-
-
-def put_if_absent(ns: str, key: str, value: Any) -> bool:
-    """Atomic create. Returns True if inserted, False if key already existed."""
-    with _lock:
-        try:
-            _db().execute(
-                "INSERT INTO kv (ns,k,v) VALUES (?,?,?)",
-                (ns, key, json.dumps(value)),
-            )
-            _db().commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def delete(ns: str, key: str) -> None:
-    with _lock:
-        _db().execute("DELETE FROM kv WHERE ns=? AND k=?", (ns, key))
+    with _db_lock:
+        _db().execute("INSERT OR REPLACE INTO kv (ns,k,v) VALUES (?,?,?)", (ns, key, json.dumps(value)))
         _db().commit()
 
 
 def list_ns(ns: str) -> list[Any]:
-    with _lock:
-        cur = _db().execute("SELECT v FROM kv WHERE ns=?", (ns,))
-        rows = cur.fetchall()
+    with _db_lock:
+        rows = _db().execute("SELECT v FROM kv WHERE ns=?", (ns,)).fetchall()
     return [json.loads(r[0]) for r in rows]
 
 
-# ---- content-addressed decision cache (per-agent namespace) ----
 def cache_get(ns: str, fingerprint: str) -> Optional[Any]:
-    with _lock:
-        cur = _db().execute(
-            "SELECT v FROM cache WHERE ns=? AND fingerprint=?", (ns, fingerprint)
-        )
-        row = cur.fetchone()
+    with _db_lock:
+        row = _db().execute("SELECT v FROM cache WHERE ns=? AND fingerprint=?", (ns, fingerprint)).fetchone()
     return json.loads(row[0]) if row else None
 
 
 def cache_put(ns: str, fingerprint: str, value: Any) -> None:
-    with _lock:
-        _db().execute(
-            "INSERT OR REPLACE INTO cache (ns,fingerprint,v) VALUES (?,?,?)",
-            (ns, fingerprint, json.dumps(value)),
-        )
+    with _db_lock:
+        _db().execute("INSERT OR REPLACE INTO cache (ns,fingerprint,v) VALUES (?,?,?)",
+                      (ns, fingerprint, json.dumps(value)))
         _db().commit()
 
 
-def transaction():
-    """Return the process lock for multi-step atomic sections."""
-    return _lock
+# ---- debug capture (only used when DEBUG_TOKEN is configured) ----
+def capture_add(entry: dict, keep: int = 60) -> None:
+    with _db_lock:
+        _db().execute("INSERT INTO capture (ts, v) VALUES (?, ?)", (time.time(), json.dumps(entry)))
+        _db().execute("DELETE FROM capture WHERE id NOT IN (SELECT id FROM capture ORDER BY id DESC LIMIT ?)", (keep,))
+        _db().commit()
+
+
+def capture_list() -> list[dict]:
+    with _db_lock:
+        rows = _db().execute("SELECT id, ts, v FROM capture ORDER BY id").fetchall()
+    return [{"id": r[0], "ts": r[1], **json.loads(r[2])} for r in rows]

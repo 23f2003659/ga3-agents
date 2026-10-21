@@ -1,38 +1,21 @@
-"""Q2 — A2A Invoice Agent.
+"""Q2 — A2A Invoice Agent (A2A 1.0 HTTP+JSON).
 
-Implements the A2A 1.0 HTTP+JSON surface for invoice action decisions:
-
-    GET  {origin}/.well-known/agent-card.json   (public)
-    POST {base}/message:send                     (Bearer)
-    GET  {base}/tasks/{id}                        (Bearer, owner only)
-    GET  {base}/tasks                             (Bearer, owner's tasks)
-    POST {base}/tasks/{id}:cancel                 (Bearer, owner only)
-
-Key invariants enforced:
-  * A2A-Version: 1.0 and application/a2a+json required on non-card routes.
-  * Idempotency by (principal, messageId) over canonical hash of the MESSAGE
-    only (configuration ignored). Changed semantic content -> 409.
-  * Lifecycle INPUT_REQUIRED (after propose) -> COMPLETED (after valid results)
-    or CANCELED. Terminal tasks are immutable.
-  * Decisions cached by canonical package content: repeat Checks make no model
-    call. Receipt continuations / polls / lists / cancel make no model call.
-  * Strict per-principal isolation; generic errors never reveal other tasks.
+Handlers take (headers, raw body) and run synchronously in a worker thread so a
+slow model call never blocks the event loop.
 """
 from __future__ import annotations
 
+import json
 import os
 import secrets
 import time
 from typing import Any, Optional
 
-from fastapi import APIRouter, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
 from . import store
-from .canonical import canonical_str, sha256_hex
+from .canonical import sha256_hex
 from .invoice_decider import decide_batch
-
-router = APIRouter()
 
 A2A_VERSION = "1.0"
 A2A_MEDIA = "application/a2a+json"
@@ -40,334 +23,259 @@ INPUT_MODE = "application/vnd.ga5.invoice-claim-batch+json"
 OUT_PROPOSALS = "application/vnd.ga5.invoice-action-proposals+json"
 OUT_RECEIPTS = "application/vnd.ga5.invoice-action-receipts+json"
 IN_RESULTS = "application/vnd.ga5.invoice-action-results+json"
+MAX_BODY = 512 * 1024
 
-MAX_BODY = 512 * 1024  # 512 KiB cap on successful responses
-
-# namespaces
-NS_TASK = "q2_task"          # key: taskId -> Task+meta
-NS_IDEMP = "q2_idemp"        # key: f"{principal}|{messageId}" -> {hash, taskId}
-NS_CACHE = "q2_decis"        # fingerprint -> decision
-
-
-def _base_url(request: Request) -> str:
-    base = os.environ.get("PUBLIC_BASE_URL")
-    if base:
-        return base.rstrip("/") + "/a2a/"
-    # fall back to request
-    return str(request.base_url).rstrip("/") + "/a2a/"
+NS_TASK = "q2_task"
+NS_IDEMP = "q2_idemp"
+NS_CACHE = "q2_decis"
+TERMINAL = ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED", "TASK_STATE_FAILED", "TASK_STATE_REJECTED")
 
 
-def _origin(request: Request) -> str:
-    base = os.environ.get("PUBLIC_BASE_URL")
-    if base:
-        return base.rstrip("/")
-    return str(request.base_url).rstrip("/")
+def _origin(base_url: str) -> str:
+    return (os.environ.get("PUBLIC_BASE_URL") or base_url).rstrip("/")
 
 
-def _a2a_json(data: Any, status: int = 200) -> Response:
-    import json as _json
-    body = _json.dumps(data).encode("utf-8")
+def _a2a(data: Any, status: int = 200) -> Response:
+    body = json.dumps(data, ensure_ascii=False).encode("utf-8")
     if status == 200 and len(body) > MAX_BODY:
-        return JSONResponse({"error": "response too large"}, status_code=500)
+        return _err(500, "RESPONSE_TOO_LARGE")
     return Response(content=body, media_type=A2A_MEDIA, status_code=status)
 
 
 def _err(status: int, code: str) -> Response:
-    # generic error body; never echo another principal's data
-    return JSONResponse({"error": code}, status_code=status)
+    return JSONResponse({"error": {"code": code}}, status_code=status)
 
 
-def _principal(request: Request) -> Optional[str]:
-    auth = request.headers.get("authorization", "")
+def _principal(h: dict) -> Optional[str]:
+    auth = h.get("authorization", "")
     if not auth.lower().startswith("bearer "):
         return None
-    token = auth[7:].strip()
-    return token or None
+    return auth[7:].strip() or None
 
 
-def _check_protocol(request: Request) -> Optional[Response]:
-    ver = request.headers.get("a2a-version")
-    if ver is not None and ver != A2A_VERSION:
-        return _err(400, "UNSUPPORTED_VERSION")
-    ctype = request.headers.get("content-type", "")
-    # accept the a2a media type (allow charset suffixes)
-    if request.method == "POST" and A2A_MEDIA not in ctype:
-        return _err(400, "UNSUPPORTED_MEDIA_TYPE")
-    if ver is None:
-        return _err(400, "UNSUPPORTED_VERSION")
+def _check_version(h: dict) -> Optional[Response]:
+    if h.get("a2a-version") != A2A_VERSION:
+        return _err(400, "VERSION_NOT_SUPPORTED")
     return None
 
 
-# --------------------------------------------------------------------------
-# Agent Card (public, origin-level)
-# --------------------------------------------------------------------------
-def agent_card(request: Request) -> Response:
-    base = _base_url(request)
-    card = {
+def _check_media(h: dict) -> Optional[Response]:
+    ctype = h.get("content-type", "").split(";")[0].strip().lower()
+    if ctype not in (A2A_MEDIA, "application/json"):
+        return _err(415 if ctype else 400, "UNSUPPORTED_MEDIA_TYPE")
+    return None
+
+
+def _now() -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _id(prefix: str) -> str:
+    return f"{prefix}-{secrets.token_hex(12)}"
+
+
+def _public(task: dict) -> dict:
+    return {k: v for k, v in task.items() if not k.startswith("_")}
+
+
+# ---------------------------------------------------------------- agent card
+def agent_card(base_url: str) -> JSONResponse:
+    base = _origin(base_url) + "/a2a/"
+    return JSONResponse({
         "name": "Invoice Action Agent",
-        "description": "Reads invoice-claim batches, proposes one safe business "
-                       "action per package with cited evidence, then executes "
-                       "only grader-accepted proposals under a receipt lifecycle.",
-        "version": "1.0.0",
+        "description": "Reads invoice-claim batches, proposes one evidence-backed business action per "
+                       "package, and executes only grader-accepted proposals under a receipt lifecycle.",
+        "version": "1.1.0",
         "protocolVersion": A2A_VERSION,
-        "capabilities": {"streaming": False, "pushNotifications": False,
-                          "stateTransitionHistory": True},
+        "capabilities": {"streaming": False, "pushNotifications": False, "stateTransitionHistory": True},
         "defaultInputModes": [INPUT_MODE],
         "defaultOutputModes": [OUT_PROPOSALS, OUT_RECEIPTS],
-        "supportedInterfaces": [
-            {"url": base, "protocolBinding": "HTTP+JSON",
-             "protocolVersion": A2A_VERSION}
-        ],
+        "supportedInterfaces": [{"url": base, "protocolBinding": "HTTP+JSON", "protocolVersion": A2A_VERSION}],
+        "securitySchemes": {"bearer": {"httpAuthSecurityScheme": {"scheme": "Bearer"}}},
+        "security": [{"bearer": []}],
         "skills": [{
             "id": "invoice_action_agent",
             "name": "invoice_action_agent",
-            "description": "Decide settle/approve/hold/reject-duplicate/exception "
-                           "for each invoice package citing decisive evidence.",
-            "tags": ["invoice", "finance", "a2a", "decision", "evidence"],
+            "description": "Choose settle/request-approval/hold/reject-duplicate/open-exception for each "
+                           "invoice package and cite the decisive evidence references.",
+            "tags": ["invoice", "accounts-payable", "evidence", "a2a"],
             "inputModes": [INPUT_MODE],
             "outputModes": [OUT_PROPOSALS, OUT_RECEIPTS],
         }],
-    }
-    return JSONResponse(card)  # public: normal JSON is fine
+    })
 
 
-# --------------------------------------------------------------------------
-# Task helpers
-# --------------------------------------------------------------------------
-def _new_id(prefix: str) -> str:
-    return f"{prefix}_{secrets.token_hex(10)}"
-
-
-def _make_task(principal: str, context_id: str, task_id: str,
-               message: dict, proposals: dict) -> dict:
-    """Build a Task in INPUT_REQUIRED with the proposals artifact."""
-    now = int(time.time())
-    return {
-        "id": task_id,
-        "contextId": context_id,
-        "status": {"state": "TASK_STATE_INPUT_REQUIRED",
-                   "timestamp": now},
-        "history": [message],
-        "artifacts": [{
-            "artifactId": _new_id("art"),
-            "parts": [{
-                "mediaType": OUT_PROPOSALS,
-                "data": proposals,
-            }],
-        }],
-        # internal bookkeeping (not part of A2A spec but allowed extra fields)
-        "_principal": principal,
-    }
-
-
-def _public_task(task: dict) -> dict:
-    t = dict(task)
-    t.pop("_principal", None)
-    return t
-
-
-# --------------------------------------------------------------------------
-# POST /message:send
-# --------------------------------------------------------------------------
-async def message_send(request: Request) -> Response:
-    principal = _principal(request)
+# ---------------------------------------------------------------- message:send
+def message_send(h: dict, raw: bytes) -> Response:
+    principal = _principal(h)
     if not principal:
         return _err(401, "UNAUTHENTICATED")
-    perr = _check_protocol(request)
-    if perr:
-        return perr
-
+    for check in (_check_version, _check_media):
+        e = check(h)
+        if e:
+            return e
     try:
-        body = await request.json()
+        body = json.loads(raw.decode("utf-8"))
     except Exception:
         return _err(400, "INVALID_JSON")
-    if not isinstance(body, dict):
-        return _err(400, "INVALID_JSON")
-
-    message = body.get("message")
-    if not isinstance(message, dict):
-        return _err(400, "INVALID_MESSAGE")
-
+    if not isinstance(body, dict) or not isinstance(body.get("message"), dict):
+        return _err(400, "INVALID_REQUEST")
+    message = body["message"]
     message_id = message.get("messageId")
-    if not message_id:
-        return _err(400, "INVALID_MESSAGE")
+    parts = message.get("parts")
+    if not isinstance(message_id, str) or not message_id or not isinstance(parts, list) or not parts \
+            or not isinstance(parts[0], dict):
+        return _err(400, "INVALID_REQUEST")
 
-    # idempotency key: hash of the MESSAGE only (ignore configuration)
-    msg_hash = sha256_hex(message)
+    msg_hash = sha256_hex(message)          # message only; configuration ignored
     idemp_key = f"{principal}|{message_id}"
-
-    with store.transaction():
+    with store.key_lock("q2idem:" + idemp_key):
         prior = store.get(NS_IDEMP, idemp_key)
         if prior is not None:
             if prior["hash"] != msg_hash:
                 return _err(409, "IDEMPOTENCY_CONFLICT")
-            # same message -> return stored task unchanged, no model call
             task = store.get(NS_TASK, prior["taskId"])
-            if task is None:
-                return _err(409, "IDEMPOTENCY_CONFLICT")
-            return _a2a_json({"task": _public_task(task)})
+            if prior.get("response") is not None:
+                return _a2a(prior["response"])
+            return _a2a({"task": _public(task)})
 
-        # Determine whether this is an initial batch or a results continuation.
-        parts = message.get("parts", [])
-        part = parts[0] if parts else {}
-        media = part.get("mediaType")
-
+        media = parts[0].get("mediaType")
         if media == IN_RESULTS:
-            return _handle_results(principal, message, msg_hash, idemp_key)
-
+            return _continue(principal, message, msg_hash, idemp_key)
         if media != INPUT_MODE:
-            return _err(400, "UNSUPPORTED_MEDIA_TYPE")
+            return _err(400, "UNSUPPORTED_PART_MEDIA_TYPE")
+        if message.get("taskId"):
+            return _err(400, "UNEXPECTED_TASK_ID")
 
-        # initial batch -> propose
-        data = part.get("data", {})
+        data = parts[0].get("data") or {}
         batch_id = data.get("batchId")
-        packages = data.get("packages", [])
-        if not batch_id or not isinstance(packages, list) or not packages:
+        packages = data.get("packages")
+        if not isinstance(batch_id, str) or not batch_id or not isinstance(packages, list) or not packages:
             return _err(400, "INVALID_BATCH")
+        pids = [(p or {}).get("packageId") for p in packages if isinstance(p, dict)]
+        if len(pids) != len(packages) or any(not isinstance(x, str) or not x for x in pids) \
+                or len(set(pids)) != len(pids):
+            return _err(400, "INVALID_PACKAGES")
 
         proposals = decide_batch(batch_id, packages, NS_CACHE)
 
-        context_id = _new_id("ctx")
-        task_id = _new_id("task")
-        task = _make_task(principal, context_id, task_id, message, proposals)
+        task_id, context_id = _id("task"), message.get("contextId") or _id("ctx")
+        stored_msg = dict(message, taskId=task_id, contextId=context_id)
+        task = {
+            "id": task_id,
+            "contextId": context_id,
+            "status": {"state": "TASK_STATE_INPUT_REQUIRED", "timestamp": _now()},
+            "history": [stored_msg],
+            "artifacts": [{
+                "artifactId": _id("proposals"),
+                "name": "invoice-action-proposals",
+                "parts": [{"mediaType": OUT_PROPOSALS, "data": proposals}],
+            }],
+            "kind": "task",
+            "_principal": principal,
+            "_batchId": batch_id,
+        }
         store.put(NS_TASK, task_id, task)
-        store.put(NS_IDEMP, idemp_key, {"hash": msg_hash, "taskId": task_id})
-        return _a2a_json({"task": _public_task(task)})
+        resp = {"task": _public(task)}
+        store.put(NS_IDEMP, idemp_key, {"hash": msg_hash, "taskId": task_id, "response": resp})
+        return _a2a(resp)
 
 
-def _handle_results(principal: str, message: dict, msg_hash: str,
-                    idemp_key: str) -> Response:
-    """Process a results continuation and complete the task."""
-    task_id = message.get("taskId")
-    context_id = message.get("contextId")
-    if not task_id or not context_id:
+def _continue(principal: str, message: dict, msg_hash: str, idemp_key: str) -> Response:
+    task_id, context_id = message.get("taskId"), message.get("contextId")
+    if not isinstance(task_id, str) or not task_id:
         return _err(400, "INVALID_CONTINUATION")
-
-    task = store.get(NS_TASK, task_id)
-    if task is None or task.get("_principal") != principal:
-        # isolation: generic 404, never reveal existence
-        return _err(404, "NOT_FOUND")
-    if task["contextId"] != context_id:
-        return _err(400, "CONTEXT_MISMATCH")
-
-    state = task["status"]["state"]
-    if state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-        # terminal replay: if same message already applied, idempotency caught
-        # it above; otherwise reject mutation of terminal task
-        return _err(409, "TASK_TERMINAL")
-
-    part = message["parts"][0]
-    data = part.get("data", {})
-    results = data.get("results", [])
-    batch_id = data.get("batchId")
-
-    # locate stored proposals
-    proposals_art = task["artifacts"][0]["parts"][0]["data"]
-    stored = {p["actionId"]: p for p in proposals_art["proposals"]}
-    stored_batch = proposals_art["batchId"]
-
-    if batch_id != stored_batch:
-        return _err(400, "BATCH_MISMATCH")
-
-    executions = []
-    for r in results:
-        aid = r.get("actionId")
-        prop = stored.get(aid)
-        if prop is None:
-            return _err(400, "UNKNOWN_ACTION")
-        # every field must match the stored proposal
-        if (r.get("packageId") != prop["packageId"]
-                or r.get("action") != prop["action"]):
-            return _err(400, "RESULT_MISMATCH")
-        if r.get("outcome") != "ACCEPTED":
-            # rejected proposals are NOT executed; remain in history only
-            continue
-        nonce = r.get("receiptNonce")
-        if not nonce:
-            return _err(400, "MISSING_NONCE")
-        executions.append({
-            "packageId": prop["packageId"],
-            "actionId": prop["actionId"],
-            "action": prop["action"],
-            "receiptNonce": nonce,
-            "facts": prop["facts"],
-            "evidenceRefs": prop["evidenceRefs"],
-        })
-
-    # append continuation to history, add receipts artifact, complete
-    task["history"].append(message)
-    task["artifacts"].append({
-        "artifactId": _new_id("art"),
-        "parts": [{
-            "mediaType": OUT_RECEIPTS,
-            "data": {"batchId": stored_batch, "executions": executions},
-        }],
-    })
-    task["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": int(time.time())}
-    store.put(NS_TASK, task_id, task)
-    store.put(NS_IDEMP, idemp_key, {"hash": msg_hash, "taskId": task_id})
-    return _a2a_json({"task": _public_task(task)})
-
-
-# --------------------------------------------------------------------------
-# GET /tasks/{id}
-# --------------------------------------------------------------------------
-def get_task(request: Request, task_id: str) -> Response:
-    principal = _principal(request)
-    if not principal:
-        return _err(401, "UNAUTHENTICATED")
-    perr = _check_version_only(request)
-    if perr:
-        return perr
-    task = store.get(NS_TASK, task_id)
-    if task is None or task.get("_principal") != principal:
-        return _err(404, "NOT_FOUND")
-    return _a2a_json(_public_task(task))
-
-
-# --------------------------------------------------------------------------
-# GET /tasks
-# --------------------------------------------------------------------------
-def list_tasks(request: Request) -> Response:
-    principal = _principal(request)
-    if not principal:
-        return _err(401, "UNAUTHENTICATED")
-    perr = _check_version_only(request)
-    if perr:
-        return perr
-    all_tasks = store.list_ns(NS_TASK)
-    mine = [_public_task(t) for t in all_tasks if t.get("_principal") == principal]
-    return _a2a_json({"tasks": mine})
-
-
-# --------------------------------------------------------------------------
-# POST /tasks/{id}:cancel
-# --------------------------------------------------------------------------
-def cancel_task(request: Request, task_id: str) -> Response:
-    principal = _principal(request)
-    if not principal:
-        return _err(401, "UNAUTHENTICATED")
-    perr = _check_version_only(request)
-    if perr:
-        return perr
-    with store.transaction():
+    with store.key_lock("q2task:" + task_id):
         task = store.get(NS_TASK, task_id)
         if task is None or task.get("_principal") != principal:
             return _err(404, "NOT_FOUND")
-        state = task["status"]["state"]
-        if state in ("TASK_STATE_COMPLETED", "TASK_STATE_CANCELED"):
-            # cancel/receipt race: terminal already -> 409
+        if context_id != task["contextId"]:
+            return _err(400, "CONTEXT_MISMATCH")
+        if task["status"]["state"] in TERMINAL:
             return _err(409, "TASK_TERMINAL")
-        task["status"] = {"state": "TASK_STATE_CANCELED",
-                          "timestamp": int(time.time())}
+
+        data = message["parts"][0].get("data") or {}
+        results = data.get("results")
+        proposals_data = task["artifacts"][0]["parts"][0]["data"]
+        if data.get("batchId") != proposals_data["batchId"]:
+            return _err(400, "BATCH_MISMATCH")
+        if not isinstance(results, list):
+            return _err(400, "INVALID_RESULTS")
+        by_aid = {p["actionId"]: p for p in proposals_data["proposals"]}
+        seen: set[str] = set()
+        executions = []
+        for r in results:
+            if not isinstance(r, dict):
+                return _err(400, "INVALID_RESULTS")
+            prop = by_aid.get(r.get("actionId"))
+            if prop is None or r["actionId"] in seen:
+                return _err(400, "ACTION_MISMATCH")
+            seen.add(r["actionId"])
+            if r.get("packageId") != prop["packageId"] or r.get("action") != prop["action"]:
+                return _err(400, "RESULT_MISMATCH")
+            outcome = r.get("outcome")
+            if outcome not in ("ACCEPTED", "REJECTED"):
+                return _err(400, "INVALID_OUTCOME")
+            if outcome == "ACCEPTED":
+                nonce = r.get("receiptNonce")
+                if not isinstance(nonce, str) or not nonce:
+                    return _err(400, "MISSING_RECEIPT")
+                executions.append({
+                    "packageId": prop["packageId"], "actionId": prop["actionId"], "action": prop["action"],
+                    "receiptNonce": nonce, "facts": prop["facts"], "evidenceRefs": prop["evidenceRefs"],
+                })
+
+        task["history"].append(message)
+        task["artifacts"].append({
+            "artifactId": _id("receipts"),
+            "name": "invoice-action-receipts",
+            "parts": [{"mediaType": OUT_RECEIPTS,
+                       "data": {"batchId": proposals_data["batchId"], "executions": executions}}],
+        })
+        task["status"] = {"state": "TASK_STATE_COMPLETED", "timestamp": _now()}
         store.put(NS_TASK, task_id, task)
-        return _a2a_json(_public_task(task))
+        resp = {"task": _public(task)}
+        store.put(NS_IDEMP, idemp_key, {"hash": msg_hash, "taskId": task_id, "response": resp})
+        return _a2a(resp)
 
 
-def _check_version_only(request: Request) -> Optional[Response]:
-    ver = request.headers.get("a2a-version")
-    if ver is None:
-        return _err(400, "UNSUPPORTED_VERSION")
-    if ver != A2A_VERSION:
-        return _err(400, "UNSUPPORTED_VERSION")
-    return None
+# ---------------------------------------------------------------- task routes
+def _auth_only(h: dict) -> tuple[Optional[str], Optional[Response]]:
+    p = _principal(h)
+    if not p:
+        return None, _err(401, "UNAUTHENTICATED")
+    e = _check_version(h)
+    return p, e
+
+
+def get_task(h: dict, task_id: str) -> Response:
+    p, e = _auth_only(h)
+    if e:
+        return e
+    task = store.get(NS_TASK, task_id)
+    if task is None or task.get("_principal") != p:
+        return _err(404, "NOT_FOUND")
+    return _a2a(_public(task))
+
+
+def list_tasks(h: dict) -> Response:
+    p, e = _auth_only(h)
+    if e:
+        return e
+    mine = [_public(t) for t in store.list_ns(NS_TASK) if t.get("_principal") == p]
+    return _a2a({"tasks": mine})
+
+
+def cancel_task(h: dict, task_id: str) -> Response:
+    p, e = _auth_only(h)
+    if e:
+        return e
+    with store.key_lock("q2task:" + task_id):
+        task = store.get(NS_TASK, task_id)
+        if task is None or task.get("_principal") != p:
+            return _err(404, "NOT_FOUND")
+        if task["status"]["state"] in TERMINAL:
+            return _err(409, "TASK_NOT_CANCELABLE")
+        task["status"] = {"state": "TASK_STATE_CANCELED", "timestamp": _now()}
+        store.put(NS_TASK, task_id, task)
+        return _a2a(_public(task))

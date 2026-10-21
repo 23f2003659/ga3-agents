@@ -1,225 +1,162 @@
-"""OTLP trace construction for Q4.
+"""OTLP trace construction for Q4 (pure data; stored with the run, never rebuilt).
 
-Builds the required span hierarchy:
-
-  SERVER   POST /v2/incidents
-  └─ INTERNAL invoke_agent incident-response
-     ├─ CLIENT   chat incident-plan          (exactly one)
-     ├─ INTERNAL execute_tool <toolName>     (one per logical executed action)
-     │  └─ CLIENT POST tool/<toolName>       (one per physical attempt)
-     ├─ INTERNAL incident.join               (when diagnostics fan out)
-     └─ INTERNAL approval_gate               (when approval is required)
-
-SpanKind: INTERNAL=1, SERVER=2, CLIENT=3. Trace/span IDs are nonzero lowercase
-hex. Every span carries ga5.run.id and ga5.public.marker. No sensitive data,
-arguments, results, prompts, transcripts, or credentials are ever exported.
+SERVER   POST /v2/incidents
+└─ INTERNAL invoke_agent <agentName>
+   ├─ CLIENT   chat incident-plan                (exactly one)
+   ├─ INTERNAL execute_tool <toolName>           (one per logical action)
+   │  └─ CLIENT POST tool/<toolName>             (one per physical attempt)
+   ├─ INTERNAL incident.join                     (when diagnostics fan out)
+   └─ INTERNAL approval_gate                     (when approval is required)
 """
 from __future__ import annotations
 
-import os
+import re
 import secrets
 import time
 from typing import Any, Optional
 
-KIND_INTERNAL = 1
-KIND_SERVER = 2
-KIND_CLIENT = 3
+INTERNAL, SERVER, CLIENT = 1, 2, 3
+_TP_RE = re.compile(r"^00-([0-9a-f]{32})-([0-9a-f]{16})-([0-9a-f]{2})$")
 
 
-def _hex(nbytes: int) -> str:
-    v = secrets.token_hex(nbytes)
-    if set(v) == {"0"}:
-        v = "0" * (nbytes * 2 - 1) + "1"
-    return v
+def _hex(n: int) -> str:
+    while True:
+        v = secrets.token_hex(n)
+        if v.strip("0"):
+            return v
 
 
-def _now_ns() -> int:
-    return time.time_ns()
+def parse_traceparent(tp: Optional[str]) -> Optional[tuple[str, str, str]]:
+    if not isinstance(tp, str):
+        return None
+    m = _TP_RE.match(tp.strip())
+    if not m or not m.group(1).strip("0") or not m.group(2).strip("0"):
+        return None
+    return m.group(1), m.group(2), m.group(3)
+
+
+def s_attr(k: str, v: Any) -> dict:
+    return {"key": k, "value": {"stringValue": str(v)}}
+
+
+def i_attr(k: str, v: int) -> dict:
+    return {"key": k, "value": {"intValue": int(v)}}
 
 
 class Trace:
-    def __init__(self, run_id: str, public_marker: str, trace_id: str,
-                 tracestate: Optional[str] = None):
-        self.run_id = run_id
-        self.public_marker = public_marker
-        self.trace_id = trace_id
-        self.tracestate = tracestate
-        self.spans: list[dict] = []
-        self.server_span_id: Optional[str] = None
-        self.agent_span_id: Optional[str] = None
-        self.execute_tool_spans: dict[str, str] = {}  # actionId -> span id
-        self.diag_clients: list[dict] = []            # list of {_client_span}
-        self.client_spans: dict[tuple, str] = {}       # (actionId,attempt)->span
+    """State is a plain dict so it can be persisted as JSON."""
 
-    # ---- lifecycle ----
-    def _base_attrs(self) -> list[dict]:
-        return [
-            _attr("ga5.run.id", self.run_id),
-            _attr("ga5.public.marker", self.public_marker),
-        ]
+    def __init__(self, state: dict):
+        self.s = state
 
-    def _span(self, name: str, kind: int, parent: Optional[str],
-              extra: Optional[list] = None, status_code: int = 0,
-              error_type: Optional[str] = None) -> dict:
-        sid = _hex(8)
-        attrs = self._base_attrs() + (extra or [])
-        s = {
-            "traceId": self.trace_id,
-            "spanId": sid,
+    @classmethod
+    def new(cls, run_id: str, marker: str, agent_name: str, model: str,
+            incoming_tp: Optional[str], incoming_ts: Optional[str]) -> "Trace":
+        parsed = parse_traceparent(incoming_tp)
+        trace_id = parsed[0] if parsed else _hex(16)
+        st = {"traceId": trace_id, "runId": run_id, "marker": marker, "spans": [],
+              "tracestate": incoming_ts if (parsed and isinstance(incoming_ts, str) and incoming_ts) else None,
+              "flags": parsed[2] if parsed else "01",
+              "execSpans": {}, "clientSpans": {}, "joinId": None, "gateId": None}
+        t = cls(st)
+        now = time.time_ns()
+        server = t._add("POST /v2/incidents", SERVER, parsed[1] if parsed else None, now, [
+            s_attr("http.request.method", "POST"), s_attr("http.route", "/v2/incidents"),
+            s_attr("url.path", "/v2/incidents")])
+        st["serverId"] = server["spanId"]
+        agent = t._add(f"invoke_agent {agent_name}", INTERNAL, server["spanId"], now + 1000, [
+            s_attr("gen_ai.operation.name", "invoke_agent"), s_attr("gen_ai.agent.name", agent_name)])
+        st["agentId"] = agent["spanId"]
+        t._add("chat incident-plan", CLIENT, agent["spanId"], now + 2000, [
+            s_attr("gen_ai.operation.name", "chat"), s_attr("gen_ai.request.model", model or "unknown")])
+        return t
+
+    # -------------------------------------------------------------- helpers
+    def _add(self, name: str, kind: int, parent: Optional[str], start: int, attrs: list) -> dict:
+        span = {
+            "traceId": self.s["traceId"],
+            "spanId": _hex(8),
             "name": name,
             "kind": kind,
-            "startTimeUnixNano": _now_ns(),
-            "endTimeUnixNano": _now_ns() + 1_000_000,
-            "attributes": attrs,
+            "startTimeUnixNano": str(start),
+            "endTimeUnixNano": str(start + 1_000_000),
+            "attributes": [s_attr("ga5.run.id", self.s["runId"]),
+                           s_attr("ga5.public.marker", self.s["marker"])] + attrs,
+            "status": {"code": 0},
         }
         if parent:
-            s["parentSpanId"] = parent
-        if status_code:
-            s["status"] = {"code": status_code}
-            if error_type:
-                # error type lives in attributes, not status
-                pass
-        self.spans.append(s)
-        return s
+            span["parentSpanId"] = parent
+        self.s["spans"].append(span)
+        return span
 
-    def start_server(self):
-        s = self._span("POST /v2/incidents", KIND_SERVER, None)
-        self.server_span_id = s["spanId"]
+    def _span(self, span_id: str) -> Optional[dict]:
+        return next((x for x in self.s["spans"] if x["spanId"] == span_id), None)
 
-    def start_agent(self, agent_name: str):
-        s = self._span(f"invoke_agent {agent_name}", KIND_INTERNAL,
-                       self.server_span_id)
-        self.agent_span_id = s["spanId"]
+    def traceparent(self, span_id: str) -> str:
+        return f"00-{self.s['traceId']}-{span_id}-{self.s['flags']}"
 
-    def add_model_span(self, model_name: str):
-        self._span("chat incident-plan", KIND_CLIENT, self.agent_span_id,
-                   extra=[
-                       _attr("gen_ai.operation.name", "chat"),
-                       _attr("gen_ai.request.model", model_name or "unknown"),
-                   ])
+    @property
+    def tracestate(self) -> Optional[str]:
+        return self.s.get("tracestate")
 
-    def add_tool_client(self, action_id: str, tool_name: str, call_id: str,
-                        attempt: int) -> dict:
-        # ensure one INTERNAL execute_tool per logical action
-        et_id = self.execute_tool_spans.get(action_id)
-        if et_id is None:
-            et = self._span(f"execute_tool {tool_name}", KIND_INTERNAL,
-                            self.agent_span_id, extra=[
-                    _attr("ga5.action.id", action_id),
-                    _attr("gen_ai.tool.name", tool_name),
-                    _attr("gen_ai.tool.call.id", call_id),
-                    _attr("gen_ai.operation.name", "execute_tool"),
-                ])
-            et_id = et["spanId"]
-            self.execute_tool_spans[action_id] = et_id
+    # -------------------------------------------------------------- tools
+    def tool_attempt(self, action_id: str, call_id: str, tool: str, attempt: int) -> str:
+        exec_id = self.s["execSpans"].get(action_id)
+        now = time.time_ns()
+        if exec_id is None:
+            ex = self._add(f"execute_tool {tool}", INTERNAL, self.s["agentId"], now, [
+                s_attr("ga5.action.id", action_id), s_attr("gen_ai.tool.name", tool),
+                s_attr("gen_ai.tool.call.id", call_id), s_attr("gen_ai.operation.name", "execute_tool")])
+            exec_id = self.s["execSpans"][action_id] = ex["spanId"]
+        cl = self._add(f"POST tool/{tool}", CLIENT, exec_id, now + 500, [
+            s_attr("ga5.action.id", action_id), i_attr("ga5.attempt", attempt),
+            s_attr("http.request.method", "POST"), i_attr("http.request.resend_count", attempt - 1),
+            s_attr("gen_ai.tool.call.id", call_id)])
+        self.s["clientSpans"][f"{action_id}|{attempt}"] = cl["spanId"]
+        return cl["spanId"]
 
-        # CLIENT span per physical attempt
-        client = self._span(f"POST tool/{tool_name}", KIND_CLIENT, et_id,
-                            extra=[
-                _attr("ga5.action.id", action_id),
-                _attr_int("ga5.attempt", attempt),
-                _attr("http.request.method", "POST"),
-                _attr_int("http.request.resend_count", attempt - 1),
-            ])
-        self.client_spans[(action_id, attempt)] = client["spanId"]
-        # track diagnostic clients for join links
-        rec = {"_client_span": client["spanId"], "action_id": action_id}
-        if client not in self.diag_clients:
-            self.diag_clients.append(rec)
-        return client
-
-    def record_receipt_on_client(self, action_id: str, attempt: int,
-                                 receipt_id: str, nonce: str,
-                                 http_status: Any, error_type: Optional[str]):
-        sid = self.client_spans.get((action_id, attempt))
-        span = next((s for s in self.spans if s["spanId"] == sid), None)
+    def record_outcome(self, action_id: str, attempt: int, receipt_id: str, nonce: Any,
+                       status: Any, error_type: Optional[str]) -> None:
+        span = self._span(self.s["clientSpans"].get(f"{action_id}|{attempt}", ""))
         if span is None:
             return
-        span["attributes"].append(_attr("ga5.receipt.id", receipt_id))
-        span["attributes"].append(_attr("ga5.receipt.nonce", nonce or ""))
-        if http_status == 503:
-            span["attributes"].append(_attr("error.type", "503"))
-            span["attributes"].append(_attr_int("http.response.status_code", 503))
+        span["attributes"] += [s_attr("ga5.receipt.id", receipt_id), s_attr("ga5.receipt.nonce", nonce)]
+        if isinstance(status, int) and status > 0:
+            span["attributes"].append(i_attr("http.response.status_code", status))
+        if status == 0 or error_type:
+            span["attributes"].append(s_attr("error.type", error_type or "timeout"))
             span["status"] = {"code": 2}
-        elif http_status == 0 and error_type == "timeout":
-            span["attributes"].append(_attr("error.type", "timeout"))
+        elif isinstance(status, int) and status >= 400:
+            span["attributes"].append(s_attr("error.type", str(status)))
             span["status"] = {"code": 2}
-        else:
-            # success: UNSET or OK, no error.type
-            if isinstance(http_status, int) and http_status:
-                span["attributes"].append(
-                    _attr_int("http.response.status_code", http_status))
+        span["endTimeUnixNano"] = str(time.time_ns())
 
-    def add_join(self, client_span_ids: list[str]):
-        s = self._span("incident.join", KIND_INTERNAL, self.agent_span_id)
-        s["links"] = [{"traceId": self.trace_id, "spanId": sid}
-                      for sid in client_span_ids]
+    def add_join(self, action_ids: list[str]) -> None:
+        if self.s.get("joinId"):
+            return
+        j = self._add("incident.join", INTERNAL, self.s["agentId"], time.time_ns(), [
+            i_attr("ga5.join.count", len(action_ids))])
+        j["links"] = [{"traceId": self.s["traceId"], "spanId": self.s["execSpans"][a]}
+                      for a in action_ids if a in self.s["execSpans"]]
+        self.s["joinId"] = j["spanId"]
 
-    def add_approval_gate(self, approval_id: str):
-        self._span("approval_gate", KIND_INTERNAL, self.agent_span_id, extra=[
-            _attr("ga5.approval.id", approval_id),
-        ])
+    def add_gate(self, approval_id: str, action_id: str) -> None:
+        g = self._add("approval_gate", INTERNAL, self.s["agentId"], time.time_ns(), [
+            s_attr("ga5.approval.id", approval_id), s_attr("ga5.action.id", action_id)])
+        self.s["gateId"] = g["spanId"]
 
-    def record_approval(self, approval_id: str, nonce: str):
-        span = next((s for s in self.spans if s["name"] == "approval_gate"), None)
-        if span:
-            span["attributes"].append(_attr("ga5.approval.receipt.nonce",
-                                             nonce or ""))
-
-    def traceparent(self, client_span: dict) -> str:
-        return f"00-{self.trace_id}-{client_span['spanId']}-01"
+    def record_approval(self, receipt_id: str, nonce: Any, decision: str) -> None:
+        g = self._span(self.s.get("gateId") or "")
+        if g:
+            g["attributes"] += [s_attr("ga5.approval.nonce", nonce), s_attr("ga5.receipt.id", receipt_id),
+                                s_attr("ga5.receipt.nonce", nonce), s_attr("ga5.approval.decision", decision)]
+            g["endTimeUnixNano"] = str(time.time_ns())
 
     def dump(self) -> dict:
         return {"resourceSpans": [{
-            "resource": {"attributes": [
-                _attr("service.name", "incident-response")]},
-            "scopeSpans": [{
-                "scope": {"name": "ga5.incident"},
-                "spans": self.spans,
-            }],
+            "resource": {"attributes": [s_attr("service.name", "incident-response"),
+                                        s_attr("ga5.run.id", self.s["runId"]),
+                                        s_attr("ga5.public.marker", self.s["marker"])]},
+            "scopeSpans": [{"scope": {"name": "ga5.incident-agent", "version": "2"},
+                            "spans": self.s["spans"]}],
         }]}
-
-    # ---- (de)serialize so replay reads stored state, never rebuilds ----
-    def serialize(self) -> dict:
-        return {
-            "run_id": self.run_id, "public_marker": self.public_marker,
-            "trace_id": self.trace_id, "tracestate": self.tracestate,
-            "spans": self.spans, "server_span_id": self.server_span_id,
-            "agent_span_id": self.agent_span_id,
-            "execute_tool_spans": self.execute_tool_spans,
-            "diag_clients": self.diag_clients,
-            "client_spans": {f"{k[0]}|{k[1]}": v
-                             for k, v in self.client_spans.items()},
-        }
-
-    @classmethod
-    def deserialize(cls, d: dict) -> "Trace":
-        t = cls(d["run_id"], d["public_marker"], d["trace_id"], d.get("tracestate"))
-        t.spans = d["spans"]
-        t.server_span_id = d["server_span_id"]
-        t.agent_span_id = d["agent_span_id"]
-        t.execute_tool_spans = d["execute_tool_spans"]
-        t.diag_clients = d["diag_clients"]
-        t.client_spans = {}
-        for k, v in d["client_spans"].items():
-            a, att = k.split("|")
-            t.client_spans[(a, int(att))] = v
-        return t
-
-
-def new_trace(run_id: str, public_marker: str,
-              incoming_traceparent: Optional[str] = None,
-              incoming_tracestate: Optional[str] = None) -> Trace:
-    if incoming_traceparent:
-        parts = incoming_traceparent.split("-")
-        if len(parts) == 4 and parts[1] and set(parts[1]) != {"0"}:
-            return Trace(run_id, public_marker, parts[1], incoming_tracestate)
-    return Trace(run_id, public_marker, _hex(16))
-
-
-def _attr(key: str, value: str) -> dict:
-    return {"key": key, "value": {"stringValue": str(value)}}
-
-
-def _attr_int(key: str, value: int) -> dict:
-    return {"key": key, "value": {"intValue": int(value)}}
