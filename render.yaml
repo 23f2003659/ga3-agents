@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: ga3-agents
+    runtime: docker
+    plan: free
+    dockerfilePath: ./Dockerfile
+    healthCheckPath: /healthz
+    envVars:
+      # Set these in the Render dashboard (or here) before first deploy:
+      - key: MODEL_API_KEY
+        sync: false
+      - key: MODEL_BASE_URL
+        value: https://api.groq.com/openai/v1
+      - key: MODEL_NAME
+        value: llama-3.1-8b-instant
+      # PUBLIC_BASE_URL must equal your live service URL (no trailing slash),
+      # e.g. https://ga3-agents.onrender.com  — set after first deploy, then redeploy.
+      - key: PUBLIC_BASE_URL
+        sync: false
