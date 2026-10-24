@@ -172,7 +172,7 @@ def _validate(raw: dict, incident: dict, catalog: list, policy: dict) -> dict | 
             seen_tools.add(name)
             diags.append({"toolName": name, "arguments": _clean_args(d.get("arguments"), tools[name]),
                           "evidence": cite(d.get("evidence"))})
-    diags = diags[:max_diag]
+    diags = _canonical_diagnostics(root, diags, incident, tools, ev)[:max_diag]
     if not diags:
         return None
     eff = raw.get("effect") if isinstance(raw.get("effect"), dict) else {}
@@ -181,6 +181,54 @@ def _validate(raw: dict, incident: dict, catalog: list, policy: dict) -> dict | 
     effect = {"toolName": eff["toolName"], "arguments": _clean_args(eff.get("arguments"), tools[eff["toolName"]]),
               "evidence": cite(eff.get("evidence"))}
     return {"rootCause": root, "evidence": ev, "diagnostics": diags, "effect": effect}
+
+
+DIAG_TOOLS = {
+    "deployment_regression": ["inspect_deployment"],
+    "database_connection_exhaustion": ["query_metrics", "query_logs"],
+    "dependency_certificate_expired": ["dependency_status"],
+    "feature_flag_recursion": ["query_logs"],
+    "traffic_capacity_exhaustion": ["query_metrics"],
+    "secret_rotation_mismatch": ["read_runbook"],
+}
+_DEP_RE = re.compile(r"\bdep_[A-Za-z0-9]+\b")
+_FLAG_RE = re.compile(r"\bflag_[A-Za-z0-9]+\b")
+
+
+def _canonical_diagnostics(root: str, diags: list, incident: dict, tools: dict, ev: list) -> list:
+    """Minimal diagnostic set per root cause; the model only fills argument details."""
+    wanted = [t for t in DIAG_TOOLS.get(root, []) if t in tools]
+    if not wanted:
+        return diags
+    by_tool = {d["toolName"]: d for d in diags}
+    text = str(incident.get("transcript", ""))
+    service = incident.get("service")
+    out, used = [], set()
+    for name in wanted:
+        d = by_tool.get(name) or {"toolName": name, "arguments": {}, "evidence": []}
+        args = dict(d.get("arguments") or {})
+        req = (tools[name].get("inputSchema") or {}).get("required") or []
+        if "service" in req:
+            args["service"] = service
+        if name == "dependency_status":
+            m = _DEP_RE.search(text)
+            if m:
+                args["dependency"] = m.group(0)
+        if name == "query_logs" and root == "feature_flag_recursion":
+            m = _FLAG_RE.search(text)
+            if m:
+                args["query"] = m.group(0)
+        defaults = {"windowMinutes": 60, "metric": "connection_pool_wait" if root.startswith("database")
+                    else "queue_depth", "query": "pool acquisition timeout", "topic": "secret rotation"}
+        for k in req:
+            if k not in args or args[k] in (None, ""):
+                args[k] = defaults.get(k, service)
+        args = {k: v for k, v in args.items() if k in req}
+        cites = [e for e in d.get("evidence") or [] if e in ev and e not in used] or \
+            [e for e in ev if e not in used][:1] or ev[:1]
+        used.update(cites)
+        out.append({"toolName": name, "arguments": args, "evidence": cites})
+    return out
 
 
 def _fallback(incident: dict, catalog: list, policy: dict) -> dict:
