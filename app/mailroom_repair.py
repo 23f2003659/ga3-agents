@@ -34,7 +34,8 @@ POLICY_HINTS = {
                   "information-only"),
     "send_approved_notice": ("send only when", "signed approval names"),
 }
-GENERIC_POLICY = ("least-privilege action boundary", "select only the action supported")
+GENERIC_POLICY = ("least-privilege action boundary", "select only the action supported",
+                  "only current evidence within")
 NOISE = ("unrelated", "archive", "archival", "training", "non-operative", "another customer",
          "old status snapshot", "historical comparison", "different account")
 
@@ -62,6 +63,10 @@ def _policy_line(d: dict, action: str) -> Optional[str]:
     for ln in specific:
         if any(h in ln["text"].lower() for h in POLICY_HINTS.get(action, ())):
             return ln["lineId"]
+    # Audit dossiers paraphrase their rules; each carries one case-specific rule
+    # beside the generic one, so cite it when the wording is unfamiliar.
+    if len(specific) == 1:
+        return specific[0]["lineId"]
     return None
 
 
@@ -202,6 +207,9 @@ def repair(d: dict, prop: dict) -> dict:
         rec = _find(d, lambda s, l: s.get("kind") == "record" and _trusted(s) and not _is_unrelated(l["text"])
                     and TEAM_RE.search(l["text"]))
         msg = _find(d, lambda s, l: s.get("kind") == "message" and l["text"].strip().lower().startswith("i am"))
+        if not msg and rec and EMAIL_RE.search(rec[0][1]["text"]):
+            claimed = EMAIL_RE.search(rec[0][1]["text"]).group(0)
+            msg = _find(d, lambda s, l: s.get("kind") == "message" and claimed in l["text"])
         if rec:
             t = rec[0][1]["text"]
             target = {"kind": "approval_queue", "id": TEAM_RE.search(t).group(1)}
