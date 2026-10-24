@@ -136,10 +136,31 @@ def send_gate(d: dict) -> dict | None:
             "lines": [grant[0]["lineId"]] + [l["lineId"] for l in scope] + [rec[0][1]["lineId"]]}
 
 
+def _send_or_draft_rule(d: dict) -> bool:
+    return any(s.get("kind") == "policy" and str(s.get("provenance", "")).startswith("signed")
+               and "send only when" in l["text"].lower() and "draft" in l["text"].lower()
+               for s, l in _lines(d))
+
+
+def _confirmation_record(d: dict):
+    return _find(d, lambda s, l: s.get("kind") == "record" and _trusted(s) and not _is_unrelated(l["text"])
+                 and TEAM_RE.search(l["text"]))
+
+
 # ---------------------------------------------------------------- repair
 def repair(d: dict, prop: dict) -> dict:
     action = prop["action"]
     target, payload = prop.get("target"), dict(prop.get("payload") or {})
+
+    # A dossier governed by the "send only when ... otherwise draft" rule is decided
+    # by code: send with an exact approval, else prepare an unsent draft.
+    if action in ("send_approved_notice", "request_confirmation", "create_draft", "no_action") \
+            and _send_or_draft_rule(d) and _status_record(d) and not _confirmation_record(d):
+        if send_gate(d) is not None:
+            action = "send_approved_notice"
+        elif action != "create_draft":
+            action = "create_draft"
+            target, payload = None, {}
 
     # Outbound gate: never send without exact, current, recipient-scoped approval.
     if action == "send_approved_notice":
