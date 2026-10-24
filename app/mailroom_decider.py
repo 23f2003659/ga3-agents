@@ -21,7 +21,7 @@ from .mailroom_repair import repair
 ACTIONS = ["create_draft", "update_internal_record", "send_approved_notice",
            "request_confirmation", "quarantine_item", "no_action"]
 CHUNK = int(os.environ.get("Q3_CHUNK", "12"))
-CACHE_VERSION = "q3v3"
+CACHE_VERSION = "q3v4"
 
 PAYLOAD_KEYS = {
     "create_draft": ["recipient", "referenceId", "status", "template"],

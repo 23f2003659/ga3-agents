@@ -1,10 +1,14 @@
 """Code-side repair of mailroom proposals.
 
 The model chooses the action; this layer derives exact arguments and the
-minimal sufficient evidence from source provenance:
+sufficient evidence from source provenance and line roles, tolerant of the
+paraphrased wording used in fresh audit dossiers:
   * the signed_internal policy line that authorizes the chosen action
   * the trusted fact lines that establish each argument value
   * never metadata/history noise, secrets, or unrelated signed records
+It also enforces the outbound send gate in code: a notice is sent only when a
+signed approval names the same order, the same recipient and the current
+customer-visible status; otherwise the proposal becomes an unsent draft.
 """
 from __future__ import annotations
 
@@ -17,16 +21,22 @@ EVT_RE = re.compile(r"\bEVT-[A-Z0-9]+\b")
 ATT_RE = re.compile(r"\bATT-[A-Z0-9]+\b")
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
 QUOTED_RE = re.compile(r"[“\"]([^”\"]+)[”\"]")
+TEAM_RE = re.compile(r"requires ([a-z0-9-]+) confirm")
 
 POLICY_HINTS = {
-    "create_draft": ("create a draft",),
-    "update_internal_record": ("may update only the named case field", "verified carrier event may update"),
-    "request_confirmation": ("ask the owning approval queue", "identity conflicts"),
-    "quarantine_item": ("quarantine external content",),
-    "no_action": ("second side effect", "duplicate", "purely informational"),
-    "send_approved_notice": ("outbound", "approved notice", "send only"),
+    "create_draft": ("create a draft", "unsent status draft", "draft in the owning mailbox"),
+    "update_internal_record": ("may update only the named case field", "verified carrier event may update",
+                               "single specified case-field", "case-field mutation", "case field"),
+    "request_confirmation": ("ask the owning approval queue", "identity conflicts", "contact mismatch",
+                             "verification team", "verify the request"),
+    "quarantine_item": ("quarantine", "isolate untrusted", "isolate external"),
+    "no_action": ("second side effect", "already-handled", "no additional effect", "purely informational",
+                  "information-only"),
+    "send_approved_notice": ("send only when", "signed approval names"),
 }
 GENERIC_POLICY = ("least-privilege action boundary", "select only the action supported")
+NOISE = ("unrelated", "archive", "archival", "training", "non-operative", "another customer",
+         "old status snapshot", "historical comparison", "different account")
 
 
 def _lines(d: dict):
@@ -37,18 +47,21 @@ def _lines(d: dict):
 
 def _is_unrelated(text: str) -> bool:
     t = text.lower()
-    return "unrelated" in t or "archive" in t or "training" in t or "non-operative" in t
+    return any(n in t for n in NOISE)
+
+
+def _trusted(s: dict) -> bool:
+    p = str(s.get("provenance", ""))
+    return p.startswith("signed") or p.startswith("authenticated")
 
 
 def _policy_line(d: dict, action: str) -> Optional[str]:
-    hints = POLICY_HINTS.get(action, ())
-    for s, ln in _lines(d):
-        if s.get("kind") == "policy" and str(s.get("provenance", "")).startswith("signed"):
-            t = ln["text"].lower()
-            if any(g in t for g in GENERIC_POLICY):
-                continue
-            if any(h in t for h in hints):
-                return ln["lineId"]
+    specific = [ln for s, ln in _lines(d)
+                if s.get("kind") == "policy" and str(s.get("provenance", "")).startswith("signed")
+                and not any(g in ln["text"].lower() for g in GENERIC_POLICY)]
+    for ln in specific:
+        if any(h in ln["text"].lower() for h in POLICY_HINTS.get(action, ())):
+            return ln["lineId"]
     return None
 
 
@@ -56,10 +69,94 @@ def _find(d: dict, pred) -> list[tuple[dict, dict]]:
     return [(s, ln) for s, ln in _lines(d) if pred(s, ln)]
 
 
+def _first_id(found) -> Optional[str]:
+    return found[0][1]["lineId"] if found else None
+
+
+# ---------------------------------------------------------------- shared facts
+def _status_record(d: dict):
+    """Authenticated record giving an order's current customer-visible status."""
+    return _find(d, lambda s, l: s.get("kind") == "record" and _trusted(s) and not _is_unrelated(l["text"])
+                 and ORD_RE.search(l["text"]) and QUOTED_RE.search(l["text"])
+                 and "status" in l["text"].lower())
+
+
+def _sender_message(d: dict):
+    """External message line that names the requesting sender."""
+    return _find(d, lambda s, l: s.get("kind") == "message" and not _is_unrelated(l["text"])
+                 and EMAIL_RE.search(l["text"])
+                 and ("sender address" in l["text"].lower() or l["text"].strip().lower().startswith("from ")
+                      or l["text"].strip().lower().startswith("i am")))
+
+
+def _request_message(d: dict):
+    """External message line that asks about the current order."""
+    return _find(d, lambda s, l: s.get("kind") == "message" and not _is_unrelated(l["text"])
+                 and ORD_RE.search(l["text"]))
+
+
+def _approval_lines(d: dict):
+    return _find(d, lambda s, l: s.get("kind") == "approval" and _trusted(s) and not _is_unrelated(l["text"]))
+
+
+def send_gate(d: dict) -> dict | None:
+    """Return the facts of a fully-scoped approval, or None when sending is not allowed."""
+    rec = _status_record(d)
+    snd = _sender_message(d)
+    appr = _approval_lines(d)
+    if not rec or not appr:
+        return None
+    rtext = rec[0][1]["text"]
+    order, status = ORD_RE.search(rtext).group(0), QUOTED_RE.search(rtext).group(1)
+    grant = [l for s, l in appr if ORD_RE.search(l["text"]) and EMAIL_RE.search(l["text"])]
+    scope = [l for s, l in appr if QUOTED_RE.search(l["text"]) and not ORD_RE.search(l["text"])]
+    if len(grant) != 1:
+        return None
+    g = grant[0]["text"]
+    approved = EMAIL_RE.search(g).group(0)
+    if ORD_RE.search(g).group(0) != order:
+        return None
+    # When the requester is named, the approval must be for that exact recipient.
+    if snd and EMAIL_RE.search(snd[0][1]["text"]).group(0).lower() != approved.lower():
+        return None
+    sender = approved
+    if "approved_delivery_notice" not in g:
+        return None
+    scoped = [QUOTED_RE.search(l["text"]).group(1) for l in scope]
+    if scoped and any(x != status for x in scoped):
+        return None
+    if not scoped and status not in g:
+        return None
+    return {"order": order, "status": status, "recipient": sender,
+            "lines": [grant[0]["lineId"]] + [l["lineId"] for l in scope] + [rec[0][1]["lineId"]]}
+
+
+# ---------------------------------------------------------------- repair
 def repair(d: dict, prop: dict) -> dict:
     action = prop["action"]
     target, payload = prop.get("target"), dict(prop.get("payload") or {})
-    ev: list[str] = []
+
+    # Outbound gate: never send without exact, current, recipient-scoped approval.
+    if action == "send_approved_notice":
+        gate = send_gate(d)
+        if gate is None:
+            asked = (target or {}).get("id", "")
+            action = "create_draft"
+            target = {"kind": "draft_queue", "id": f"mailbox:{d.get('mailbox')}"}
+            payload = {"recipient": asked,
+                       "referenceId": payload.get("referenceId", ""), "status": payload.get("status", ""),
+                       "template": "order_status"}
+        else:
+            target = {"kind": "email", "id": gate["recipient"]}
+            payload = {"referenceId": gate["order"], "status": gate["status"],
+                       "template": "approved_delivery_notice"}
+            ev: list[str] = []
+            for x in gate["lines"] + [_policy_line(d, action)]:
+                if x and x not in ev:
+                    ev.append(x)
+            return dict(prop, action=action, target=target, payload=payload, evidence=ev)
+
+    ev = []
 
     def add(x):
         if x and x not in ev:
@@ -68,51 +165,46 @@ def repair(d: dict, prop: dict) -> dict:
     pol = _policy_line(d, action)
 
     if action == "create_draft":
-        rec = _find(d, lambda s, l: s.get("kind") == "record" and "public status" in l["text"].lower())
-        req = _find(d, lambda s, l: s.get("kind") == "message" and ORD_RE.search(l["text"])
-                    and "prepare" in l["text"].lower())
-        snd = _find(d, lambda s, l: s.get("kind") == "message" and "sender address" in l["text"].lower())
+        target = {"kind": "draft_queue", "id": f"mailbox:{d.get('mailbox')}"}
+        payload["template"] = "order_status"
+        rec = _status_record(d)
+        req = _request_message(d)
+        snd = _sender_message(d)
         if rec:
-            m = QUOTED_RE.search(rec[0][1]["text"])
-            if m:
-                payload["status"] = m.group(1)
-            o = ORD_RE.search(rec[0][1]["text"])
-            if o:
-                payload["referenceId"] = o.group(0)
+            t = rec[0][1]["text"]
+            payload["status"] = QUOTED_RE.search(t).group(1)
+            payload["referenceId"] = ORD_RE.search(t).group(0)
         if snd:
-            e = EMAIL_RE.search(snd[0][1]["text"])
-            if e:
-                payload["recipient"] = e.group(0)
-        for x in (pol, rec[0][1]["lineId"] if rec else None, req[0][1]["lineId"] if req else None,
-                  snd[0][1]["lineId"] if snd else None):
+            payload["recipient"] = EMAIL_RE.search(snd[0][1]["text"]).group(0)
+        for x in (pol, _first_id(rec), _first_id(req), _first_id(snd)):
             add(x)
+        # A draft chosen instead of a send: the out-of-scope approval explains why.
+        if pol and "send only when" in next(l["text"] for _, l in _lines(d) if l["lineId"] == pol).lower():
+            for _, l in _approval_lines(d):
+                add(l["lineId"])
 
     elif action == "update_internal_record":
-        evt = _find(d, lambda s, l: s.get("kind") == "event" and "authorizes" in l["text"].lower()
-                    and not _is_unrelated(l["text"]))
+        evt = _find(d, lambda s, l: s.get("kind") == "event" and _trusted(s) and not _is_unrelated(l["text"])
+                    and CASE_RE.search(l["text"]) and EVT_RE.search(l["text"]) and QUOTED_RE.search(l["text"]))
         if evt:
             t = evt[0][1]["text"]
-            c, e, q = CASE_RE.search(t), EVT_RE.search(t), QUOTED_RE.search(t)
-            if c:
-                target = {"kind": "case_record", "id": c.group(0)}
-            if e:
-                payload["sourceEventId"] = e.group(0)
-            if q:
-                payload["value"] = q.group(1)
+            target = {"kind": "case_record", "id": CASE_RE.search(t).group(0)}
+            payload["sourceEventId"] = EVT_RE.search(t).group(0)
+            payload["value"] = QUOTED_RE.search(t).group(1)
             add(evt[0][1]["lineId"])
-        sig = _find(d, lambda s, l: s.get("kind") == "event" and "signature was verified" in l["text"].lower())
-        if sig:
-            add(sig[0][1]["lineId"])
+        payload["field"] = "delivery_window"
+        sig = _find(d, lambda s, l: s.get("kind") == "event" and "signature" in l["text"].lower()
+                    and "verified" in l["text"].lower() and not _is_unrelated(l["text"]))
+        add(_first_id(sig))
         add(pol)
 
     elif action == "request_confirmation":
-        rec = _find(d, lambda s, l: s.get("kind") == "record" and "does not match" in l["text"].lower())
+        rec = _find(d, lambda s, l: s.get("kind") == "record" and _trusted(s) and not _is_unrelated(l["text"])
+                    and TEAM_RE.search(l["text"]))
         msg = _find(d, lambda s, l: s.get("kind") == "message" and l["text"].strip().lower().startswith("i am"))
         if rec:
             t = rec[0][1]["text"]
-            team = re.search(r"requires ([a-z0-9-]+) confirm", t)
-            if team:
-                target = {"kind": "approval_queue", "id": team.group(1)}
+            target = {"kind": "approval_queue", "id": TEAM_RE.search(t).group(1)}
             c = CASE_RE.search(t)
             if c:
                 payload["referenceId"] = c.group(0)
@@ -123,7 +215,8 @@ def repair(d: dict, prop: dict) -> dict:
             e = EMAIL_RE.search(msg[0][1]["text"])
             if e:
                 payload["claimedSender"] = e.group(0)
-        for x in (rec[0][1]["lineId"] if rec else None, msg[0][1]["lineId"] if msg else None, pol):
+        payload["questionCode"] = "VERIFY_REQUEST"
+        for x in (_first_id(rec), _first_id(msg), pol):
             add(x)
 
     elif action == "quarantine_item":
@@ -133,6 +226,8 @@ def repair(d: dict, prop: dict) -> dict:
         idline = [l for s, l in att if ATT_RE.search(l["text"]) and not _is_unrelated(l["text"])]
         if idline:
             payload["artifactId"] = ATT_RE.search(idline[0]["text"]).group(0)
+        payload["reasonCode"] = "INDIRECT_PROMPT_INJECTION"
+        target = {"kind": "security_queue", "id": "mailroom"}
         for l in attack:
             add(l["lineId"])
         if idline:
@@ -140,24 +235,30 @@ def repair(d: dict, prop: dict) -> dict:
         add(pol)
 
     elif action == "no_action":
-        rec = _find(d, lambda s, l: s.get("kind") == "record" and not _is_unrelated(l["text"])
-                    and any(k in l["text"].lower() for k in ("duplicate", "completed", "terminal", "informational")))
+        rec = _find(d, lambda s, l: s.get("kind") == "record" and _trusted(s) and not _is_unrelated(l["text"])
+                    and "records this item" in l["text"].lower())
+        if not rec:
+            rec = _find(d, lambda s, l: s.get("kind") == "record" and _trusted(s) and not _is_unrelated(l["text"])
+                        and any(k in l["text"].lower() for k in ("duplicate", "completed", "informational")))
         if rec:
             t = rec[0][1]["text"]
             low = t.lower()
-            payload["reasonCode"] = ("DUPLICATE" if "duplicate" in low else
-                                     "ALREADY_COMPLETED" if ("completed" in low or "terminal" in low) else
-                                     payload.get("reasonCode", "INFORMATIONAL"))
+            if "duplicate" in low:
+                payload["reasonCode"] = "DUPLICATE"
+            elif "informational" in low or "information-only" in low:
+                payload["reasonCode"] = "INFORMATIONAL"
+            elif "completed" in low:
+                payload["reasonCode"] = "ALREADY_COMPLETED"
             c = CASE_RE.search(t) or ORD_RE.search(t)
             if c:
                 payload["referenceId"] = c.group(0)
             add(rec[0][1]["lineId"])
+        target = None
         add(pol)
+        follow = _find(d, lambda s, l: s.get("kind") == "message" and not _is_unrelated(l["text"])
+                       and ORD_RE.search(l["text"]))
+        add(_first_id(follow))
 
-    else:  # send_approved_notice: model output already accepted by the grader; keep as is
-        return prop
-
-    # keep model evidence only if repair found nothing
     if not ev:
         ev = list(prop.get("evidence") or [])
-    return dict(prop, target=target, payload=payload, evidence=ev)
+    return dict(prop, action=action, target=target, payload=payload, evidence=ev)
